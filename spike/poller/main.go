@@ -44,14 +44,21 @@ func main() {
 	proxy := os.Getenv("HTTP_PROXY") + os.Getenv("http_proxy")
 	fmt.Fprintf(os.Stderr, "agent=%s url=%s http_proxy_set=%v\n", *agent, *base, proxy != "")
 
-	enc.Encode(get(c, *agent, "whois", 0, *base+"/whois"))
-	for _, s := range strings.Split(*sweep, ",") {
+	emit := func(r result) {
+		if err := enc.Encode(r); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+
+	emit(get(c, *agent, "whois", 0, *base+"/whois"))
+	for s := range strings.SplitSeq(*sweep, ",") {
 		secs, err := strconv.Atoi(strings.TrimSpace(s))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "bad sweep value %q\n", s)
 			os.Exit(2)
 		}
-		enc.Encode(get(c, *agent, "hold", secs, fmt.Sprintf("%s/hold?secs=%d", *base, secs)))
+		emit(get(c, *agent, "hold", secs, fmt.Sprintf("%s/hold?secs=%d", *base, secs)))
 	}
 }
 
