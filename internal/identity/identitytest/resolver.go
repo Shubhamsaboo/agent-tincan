@@ -5,6 +5,7 @@ package identitytest
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 
 	"github.com/mvanhorn/agent-tincan/internal/identity"
@@ -19,9 +20,7 @@ type Resolver struct {
 // New returns a Resolver seeded with addr -> node.
 func New(nodes map[string]identity.Node) *Resolver {
 	cp := make(map[string]identity.Node, len(nodes))
-	for k, v := range nodes {
-		cp[k] = v
-	}
+	maps.Copy(cp, nodes)
 	return &Resolver{nodes: cp}
 }
 
