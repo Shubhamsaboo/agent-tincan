@@ -1,0 +1,7 @@
+/tincan
+/dist/
+/spike/bin/
+*.db
+*.db-journal
+.env
+coverage.out
