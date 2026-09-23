@@ -70,6 +70,19 @@ type Reply struct {
 	CreatedAt time.Time `json:"created_at,omitzero"`
 }
 
+// Result is a request with its current status and reply, if any. The relay
+// returns it for get-reply and for each step of a trace.
+type Result struct {
+	Request Request `json:"request"`
+	Status  Status  `json:"status"`
+	Reply   *Reply  `json:"reply,omitempty"`
+}
+
+// Done reports whether the request has reached a final state.
+func (r Result) Done() bool {
+	return r.Status.Terminal() || r.Status == StatusCancelled || r.Status == StatusExpired
+}
+
 // sendInput is the only part of a send the relay accepts from a client.
 type sendInput struct {
 	To       string `json:"to"`

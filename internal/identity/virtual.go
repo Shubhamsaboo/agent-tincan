@@ -23,7 +23,7 @@ type virtualResolver struct{ Resolver }
 
 func (v virtualResolver) WhoIs(ctx context.Context, addr string) (Node, error) {
 	if name, ok := strings.CutPrefix(addr, VirtualPrefix); ok {
-		return Node{ID: VirtualPrefix + name, Name: VirtualPrefix + name}, nil
+		return Node{ID: VirtualAddr(name), Name: VirtualAddr(name)}, nil
 	}
 	return v.Resolver.WhoIs(ctx, addr)
 }
@@ -35,5 +35,5 @@ func (d *Directory) BindVirtual(ctx context.Context, name string) error {
 	if !nameRE.MatchString(name) {
 		return ErrUnknownAgent
 	}
-	return d.store.PutAgent(ctx, Agent{Name: name, NodeID: VirtualPrefix + name, NodeName: VirtualPrefix + name, JoinedAt: d.cfg.Now()})
+	return d.store.PutAgent(ctx, Agent{Name: name, NodeID: VirtualAddr(name), NodeName: VirtualAddr(name), JoinedAt: d.cfg.Now()})
 }

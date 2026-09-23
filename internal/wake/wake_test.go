@@ -67,16 +67,13 @@ func auditStore(t *testing.T) *store.Store {
 }
 
 func events(t *testing.T, st *store.Store) []string {
-	rows, err := st.DB().Query(`SELECT event FROM audit ORDER BY seq`)
+	evs, err := st.AuditEvents(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
 	var out []string
-	for rows.Next() {
-		var e string
-		rows.Scan(&e)
-		out = append(out, e)
+	for _, e := range evs {
+		out = append(out, e.Event)
 	}
 	return out
 }

@@ -13,9 +13,6 @@ import (
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 )
 
-// Cap on inline waits so no tool call runs past common MCP timeouts.
-const maxInlineWait = 20 * time.Second
-
 func connect() (*client.Relay, client.Config, error) {
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -27,8 +24,6 @@ func connect() (*client.Relay, client.Config, error) {
 	r, err := client.NewRelay(cfg.Relay, cfg.Proxy)
 	return r, cfg, err
 }
-
-func clampWait(d time.Duration) time.Duration { return min(max(d, 0), maxInlineWait) }
 
 func agentCmds() []*cobra.Command {
 	return []*cobra.Command{joinCmd(), inviteCmd(), removeCmd(), agentsCmd(), askCmd(), getCmd(), inboxCmd(), replyCmd(), cancelCmd(), waitCmd()}
@@ -151,11 +146,7 @@ func agentsCmd() *cobra.Command {
 func formatAgents(agents []client.AgentInfo) string {
 	var b strings.Builder
 	for _, a := range agents {
-		state := "offline"
-		if a.Online {
-			state = "online"
-		}
-		fmt.Fprintf(&b, "%-14s %-8s wake=%s\n", a.Name, state, a.Wake)
+		fmt.Fprintf(&b, "%-14s %-8s wake=%s\n", a.Name, a.State(), a.Wake)
 	}
 	if b.Len() == 0 {
 		return "No agents have joined yet.\n"
@@ -185,7 +176,7 @@ func askCmd() *cobra.Command {
 				cmd.Printf("Sent to %s (request %s).\n", args[0], req.ID)
 				return nil
 			}
-			res, err := r.Ask(cmd.Context(), args[0], body, parent, clampWait(wait))
+			res, err := r.Ask(cmd.Context(), args[0], body, parent, client.ClampWait(wait))
 			if err != nil {
 				return err
 			}
@@ -193,7 +184,7 @@ func askCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().DurationVar(&wait, "wait", maxInlineWait, "how long to wait for the reply (max 20s)")
+	cmd.Flags().DurationVar(&wait, "wait", client.MaxInlineWait, "how long to wait for the reply (max 20s)")
 	cmd.Flags().StringVar(&parent, "parent", "", "the request you are handling, if this continues it (usually automatic)")
 	cmd.Flags().BoolVar(&notify, "notify", false, "send without waiting for a reply")
 	return cmd
@@ -210,7 +201,7 @@ func getCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			res, err := r.Get(cmd.Context(), args[0], clampWait(wait))
+			res, err := r.Get(cmd.Context(), args[0], client.ClampWait(wait))
 			if err != nil {
 				return err
 			}
@@ -232,7 +223,7 @@ func inboxCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out, err := checkInbox(cmd.Context(), r, clampWait(wait))
+			out, err := checkInbox(cmd.Context(), r, client.ClampWait(wait))
 			if err != nil {
 				return err
 			}

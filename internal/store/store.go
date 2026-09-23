@@ -160,6 +160,29 @@ func (s *Store) Agents(ctx context.Context) ([]identity.Agent, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) AgentByNode(ctx context.Context, nodeID string) (identity.Agent, bool, error) {
+	return s.agentWhere(ctx, "node_id = ?", nodeID)
+}
+
+func (s *Store) AgentByName(ctx context.Context, name string) (identity.Agent, bool, error) {
+	return s.agentWhere(ctx, "name = ?", name)
+}
+
+func (s *Store) agentWhere(ctx context.Context, where string, arg string) (identity.Agent, bool, error) {
+	var a identity.Agent
+	var joined int64
+	err := s.db.QueryRowContext(ctx, `SELECT name, node_id, node_name, joined_at FROM agents WHERE `+where, arg).
+		Scan(&a.Name, &a.NodeID, &a.NodeName, &joined)
+	if errors.Is(err, sql.ErrNoRows) {
+		return identity.Agent{}, false, nil
+	}
+	if err != nil {
+		return identity.Agent{}, false, err
+	}
+	a.JoinedAt = time.UnixMilli(joined)
+	return a, true, nil
+}
+
 func (s *Store) PutInvite(ctx context.Context, inv identity.Invite) error {
 	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO invites(code, name, expires) VALUES (?, ?, ?)`,
 		inv.Code, inv.Name, inv.Expires.UnixMilli())
@@ -296,11 +319,7 @@ func (s *Store) Reply(ctx context.Context, id, agent string, rep envelope.Reply)
 }
 
 // Result is a request with its current status and reply, if any.
-type Result struct {
-	Request envelope.Request `json:"request"`
-	Status  envelope.Status  `json:"status"`
-	Reply   *envelope.Reply  `json:"reply,omitempty"`
-}
+type Result = envelope.Result
 
 // Get returns a request for its sender or its target.
 func (s *Store) Get(ctx context.Context, id, agent string) (Result, error) {
@@ -311,21 +330,28 @@ func (s *Store) Get(ctx context.Context, id, agent string) (Result, error) {
 	if req.From != agent && req.To != agent {
 		return Result{}, ErrNotFound
 	}
-	out := Result{Request: req, Status: status}
+	rep, err := s.replyFor(ctx, id)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Request: req, Status: status, Reply: rep}, nil
+}
+
+// replyFor returns the stored reply for a request, or nil if none yet.
+func (s *Store) replyFor(ctx context.Context, id string) (*envelope.Reply, error) {
 	var rep envelope.Reply
 	var created int64
 	var st string
-	err = s.db.QueryRowContext(ctx, `SELECT from_agent, status, body, created_at FROM replies WHERE request_id = ?`, id).
+	err := s.db.QueryRowContext(ctx, `SELECT from_agent, status, body, created_at FROM replies WHERE request_id = ?`, id).
 		Scan(&rep.From, &st, &rep.Body, &created)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-	case err != nil:
-		return Result{}, err
-	default:
-		rep.RequestID, rep.Status, rep.CreatedAt = id, envelope.Status(st), time.UnixMilli(created).UTC()
-		out.Reply = &rep
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
 	}
-	return out, nil
+	if err != nil {
+		return nil, err
+	}
+	rep.RequestID, rep.Status, rep.CreatedAt = id, envelope.Status(st), time.UnixMilli(created).UTC()
+	return &rep, nil
 }
 
 // Cancel lets the sender withdraw a request the target has not claimed.
@@ -371,10 +397,11 @@ func (s *Store) CancelAllTo(ctx context.Context, agent string) ([]string, error)
 
 // Transition is one state change made by Sweep.
 type Transition struct {
-	ID     string
-	From   string
-	To     string
-	Status envelope.Status
+	ID      string
+	TraceID string
+	From    string
+	To      string
+	Status  envelope.Status
 }
 
 // Sweep expires requests past their TTL and returns requests whose delivery
@@ -391,7 +418,7 @@ func (s *Store) Sweep(ctx context.Context) ([]Transition, error) {
 		for rows.Next() {
 			var t Transition
 			var st string
-			if err := rows.Scan(&t.ID, &t.From, &t.To, &st); err != nil {
+			if err := rows.Scan(&t.ID, &t.TraceID, &t.From, &t.To, &st); err != nil {
 				return err
 			}
 			t.Status = envelope.Status(st)
@@ -400,12 +427,12 @@ func (s *Store) Sweep(ctx context.Context) ([]Transition, error) {
 		return rows.Err()
 	}
 	if err := collect(`UPDATE requests SET status = ?, lease_until = 0, updated_at = ?
-		WHERE status IN (?, ?) AND expires_at <= ? RETURNING id, from_agent, to_agent, status`,
+		WHERE status IN (?, ?) AND expires_at <= ? RETURNING id, trace_id, from_agent, to_agent, status`,
 		string(envelope.StatusExpired), now, string(envelope.StatusQueued), string(envelope.StatusDelivered), now); err != nil {
 		return nil, err
 	}
 	if err := collect(`UPDATE requests SET status = ?, lease_until = 0, updated_at = ?
-		WHERE status IN (?, ?) AND lease_until > 0 AND lease_until <= ? RETURNING id, from_agent, to_agent, status`,
+		WHERE status IN (?, ?) AND lease_until > 0 AND lease_until <= ? RETURNING id, trace_id, from_agent, to_agent, status`,
 		string(envelope.StatusQueued), now, string(envelope.StatusDelivered), string(envelope.StatusClaimed), now); err != nil {
 		return nil, err
 	}

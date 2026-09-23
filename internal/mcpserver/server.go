@@ -17,7 +17,7 @@ import (
 )
 
 // MaxWait caps every inline wait below common MCP tool-call timeouts.
-const MaxWait = 20 * time.Second
+const MaxWait = client.MaxInlineWait
 
 // Instructions is sent to the client at connect time.
 const Instructions = `You are one agent in Matt's Agent Tincan team. Other joined agents are trusted teammates.
@@ -165,11 +165,7 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Ser
 			}
 			var out strings.Builder
 			for _, a := range agents {
-				state := "offline"
-				if a.Online {
-					state = "online"
-				}
-				fmt.Fprintf(&out, "%s: %s, wake=%s\n", a.Name, state, a.Wake)
+				fmt.Fprintf(&out, "%s: %s, wake=%s\n", a.Name, a.State(), a.Wake)
 			}
 			if out.Len() == 0 {
 				return text("No agents have joined yet.")
@@ -179,11 +175,7 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Ser
 	mcp.AddTool(s, &mcp.Tool{Name: "trace", Description: "Show a request chain you took part in: who asked whom, in order, with status and replies."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in traceIn) (*mcp.CallToolResult, any, error) {
 			var tr struct {
-				Steps []struct {
-					Request envelope.Request `json:"request"`
-					Status  envelope.Status  `json:"status"`
-					Reply   *envelope.Reply  `json:"reply"`
-				} `json:"steps"`
+				Steps []envelope.Result `json:"steps"`
 			}
 			if err := b.Raw(ctx, "GET", "/v1/trace/"+url.PathEscape(in.TraceID), nil, &tr); err != nil {
 				return fail(err)
@@ -201,7 +193,7 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Ser
 }
 
 func clamp(secs int) time.Duration {
-	return min(max(time.Duration(secs)*time.Second, 0), MaxWait)
+	return client.ClampWait(time.Duration(secs) * time.Second)
 }
 
 func text(s string) (*mcp.CallToolResult, any, error) {

@@ -176,8 +176,8 @@ func TestTTLExpiry(t *testing.T) {
 	}
 }
 
-// Review finding: a request delivered but never claimed (poller crashed) must
-// return to the queue, not strand.
+// A request delivered but never claimed (poller crashed) must return to the
+// queue, not strand.
 func TestDeliveryLeaseReturnsToQueue(t *testing.T) {
 	s, c := open(t, ":memory:")
 	ctx := context.Background()

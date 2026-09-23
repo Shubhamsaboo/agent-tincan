@@ -53,6 +53,9 @@ type Store interface {
 	PutAgent(ctx context.Context, a Agent) error
 	DeleteAgent(ctx context.Context, name string) (bool, error)
 	Agents(ctx context.Context) ([]Agent, error)
+	// AgentByNode and AgentByName are point lookups for the hot request path.
+	AgentByNode(ctx context.Context, nodeID string) (Agent, bool, error)
+	AgentByName(ctx context.Context, name string) (Agent, bool, error)
 	PutInvite(ctx context.Context, inv Invite) error
 	// TakeInvite removes and returns the invite, so a code works once.
 	TakeInvite(ctx context.Context, code string) (Invite, bool, error)
@@ -88,16 +91,20 @@ func (d *Directory) Attribute(ctx context.Context, remoteAddr string) (string, e
 	if err != nil {
 		return "", err
 	}
-	agents, err := d.store.Agents(ctx)
+	a, ok, err := d.store.AgentByNode(ctx, n.ID)
 	if err != nil {
 		return "", err
 	}
-	for _, a := range agents {
-		if a.NodeID == n.ID {
-			return a.Name, nil
-		}
+	if !ok {
+		return "", fmt.Errorf("%s: %w", n.Name, ErrNotJoined)
 	}
-	return "", fmt.Errorf("%s: %w", n.Name, ErrNotJoined)
+	return a.Name, nil
+}
+
+// Has reports whether name is a joined agent.
+func (d *Directory) Has(ctx context.Context, name string) (bool, error) {
+	_, ok, err := d.store.AgentByName(ctx, name)
+	return ok, err
 }
 
 // Invite creates a one-time code that joins the next machine to use it as
@@ -109,7 +116,7 @@ func (d *Directory) Invite(ctx context.Context, remoteAddr, name string) (string
 	if !nameRE.MatchString(name) {
 		return "", fmt.Errorf("agent name %q must be 1-32 lowercase letters, digits, or dashes", name)
 	}
-	code, err := newCode()
+	code, err := NewCode()
 	if err != nil {
 		return "", err
 	}
@@ -136,14 +143,10 @@ func (d *Directory) Join(ctx context.Context, remoteAddr, code string) (string, 
 	if !ok || d.cfg.Now().After(inv.Expires) {
 		return "", ErrBadInvite
 	}
-	agents, err := d.store.Agents(ctx)
-	if err != nil {
+	if a, ok, err := d.store.AgentByNode(ctx, n.ID); err != nil {
 		return "", err
-	}
-	for _, a := range agents {
-		if a.NodeID == n.ID && a.Name != inv.Name {
-			return "", fmt.Errorf("%s is %q: %w", n.Name, a.Name, ErrNodeTaken)
-		}
+	} else if ok && a.Name != inv.Name {
+		return "", fmt.Errorf("%s is %q: %w", n.Name, a.Name, ErrNodeTaken)
 	}
 	a := Agent{Name: inv.Name, NodeID: n.ID, NodeName: n.Name, JoinedAt: d.cfg.Now()}
 	if err := d.store.PutAgent(ctx, a); err != nil {
@@ -194,7 +197,8 @@ func (d *Directory) requireAdmin(ctx context.Context, remoteAddr string) error {
 // codeAlphabet drops 0, 1, I, and O so codes read cleanly aloud.
 const codeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-func newCode() (string, error) {
+// NewCode returns a random one-time code shaped XXXX-XXXX.
+func NewCode() (string, error) {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		return "", err

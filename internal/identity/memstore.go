@@ -44,6 +44,24 @@ func (m *MemoryStore) Agents(_ context.Context) ([]Agent, error) {
 	return out, nil
 }
 
+func (m *MemoryStore) AgentByNode(_ context.Context, nodeID string) (Agent, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.agents {
+		if a.NodeID == nodeID {
+			return a, true, nil
+		}
+	}
+	return Agent{}, false, nil
+}
+
+func (m *MemoryStore) AgentByName(_ context.Context, name string) (Agent, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[name]
+	return a, ok, nil
+}
+
 func (m *MemoryStore) PutInvite(_ context.Context, inv Invite) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

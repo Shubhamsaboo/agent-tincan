@@ -17,20 +17,13 @@ import (
 )
 
 // Result mirrors the relay's view of one request.
-type Result struct {
-	Request envelope.Request `json:"request"`
-	Status  envelope.Status  `json:"status"`
-	Reply   *envelope.Reply  `json:"reply,omitempty"`
-}
+type Result = envelope.Result
 
-// Done reports whether the request has reached a final state.
-func (r Result) Done() bool {
-	switch r.Status {
-	case envelope.StatusAnswered, envelope.StatusFailed, envelope.StatusDeclined, envelope.StatusCancelled, envelope.StatusExpired:
-		return true
-	}
-	return false
-}
+// MaxInlineWait caps every inline wait below common MCP tool-call timeouts.
+const MaxInlineWait = 20 * time.Second
+
+// ClampWait bounds d to [0, MaxInlineWait].
+func ClampWait(d time.Duration) time.Duration { return min(max(d, 0), MaxInlineWait) }
 
 // AgentInfo is one joined agent as the relay reports it.
 type AgentInfo struct {
@@ -38,6 +31,14 @@ type AgentInfo struct {
 	Online   bool      `json:"online"`
 	LastPoll time.Time `json:"last_poll,omitzero"`
 	Wake     string    `json:"wake"`
+}
+
+// State is "online" or "offline".
+func (a AgentInfo) State() string {
+	if a.Online {
+		return "online"
+	}
+	return "offline"
 }
 
 // APIError is a non-2xx response from the relay.

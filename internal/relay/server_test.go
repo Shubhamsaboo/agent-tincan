@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 	"github.com/mvanhorn/agent-tincan/internal/identity"
 	"github.com/mvanhorn/agent-tincan/internal/identity/identitytest"
@@ -204,7 +205,7 @@ func TestRemoveCancelsQueuedRequests(t *testing.T) {
 func TestAgentsListShowsPresence(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.do(museAddr, "GET", "/v1/poll?hold=0", "", http.StatusNoContent, nil)
-	var out struct{ Agents []AgentInfo }
+	var out struct{ Agents []client.AgentInfo }
 	h.do(grokAddr, "GET", "/v1/agents", "", http.StatusOK, &out)
 	online := map[string]bool{}
 	for _, a := range out.Agents {
@@ -248,8 +249,7 @@ func TestSweepRequeuesAndWakesPoller(t *testing.T) {
 func TestOversizeBodyRejected(t *testing.T) {
 	h := newHarness(t, Config{})
 	big := strings.Repeat("x", 2<<20)
-	rec := h.do(grokAddr, "POST", "/v1/send", `{"to":"muse","body":"`+big+`"}`, http.StatusRequestEntityTooLarge, nil)
-	_ = rec
+	h.do(grokAddr, "POST", "/v1/send", `{"to":"muse","body":"`+big+`"}`, http.StatusRequestEntityTooLarge, nil)
 }
 
 type traceOut struct {

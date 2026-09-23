@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/identity"
@@ -42,10 +41,9 @@ func New(t *testing.T, cfg relay.Config) *Mesh {
 		addrs["muse"]:     {ID: "nMUSE", Name: "muse"},
 	})
 	dir := identity.NewDirectory(st, identity.WithVirtual(who), identity.Config{Admins: []string{"macbook-pro-44"}})
-	m0 := dir
 	srv := relay.New(dir, st, cfg)
 	srv.SetPreparer(policy.New(st, policy.Config{}))
-	m := &Mesh{Server: srv, Store: st, Dir: m0, urls: map[string]string{}}
+	m := &Mesh{Server: srv, Store: st, Dir: dir, urls: map[string]string{}}
 	h := srv.Handler()
 	for name, addr := range addrs {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -77,9 +75,3 @@ func (m *Mesh) Client(t *testing.T, name string) *client.Relay {
 	}
 	return r
 }
-
-// URL returns the base URL that the relay attributes to agent name.
-func (m *Mesh) URL(name string) string { return m.urls[name] }
-
-// Short is a small wait used by tests.
-const Short = 50 * time.Millisecond

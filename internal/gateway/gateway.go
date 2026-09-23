@@ -29,6 +29,7 @@ type Gateway struct {
 
 	mu       sync.Mutex
 	failures []time.Time // recent bad login codes, for lockout
+	servers  sync.Map    // agent name -> *mcp.Server, built once per agent
 }
 
 // New builds a gateway. relay is the relay's agent API handler; requests are
@@ -50,7 +51,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /token", g.token)
 	mux.Handle("/mcp", g.requireToken(mcp.NewStreamableHTTPHandler(g.serverFor, &mcp.StreamableHTTPOptions{Stateless: true})))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		client.LimitBody(w, r, client.Defaults(client.RelayAPI).MaxBodyBytes)
 		mux.ServeHTTP(w, r)
 	})
 }
@@ -73,12 +74,16 @@ func (g *Gateway) requireToken(next http.Handler) http.Handler {
 	})
 }
 
-// serverFor builds an MCP server whose relay calls are attributed to the
-// token's agent.
+// serverFor returns the MCP server whose relay calls are attributed to the
+// token's agent, building it on first use.
 func (g *Gateway) serverFor(r *http.Request) *mcp.Server {
 	agent, _ := r.Context().Value(agentKey{}).(string)
+	if s, ok := g.servers.Load(agent); ok {
+		return s.(*mcp.Server)
+	}
 	rc := client.NewRelayHTTP("http://tincan-relay", &http.Client{Transport: inProcess{h: g.relay, addr: identity.VirtualAddr(agent)}})
-	return mcpserver.New(rc, g.version)
+	s, _ := g.servers.LoadOrStore(agent, mcpserver.New(rc, g.version))
+	return s.(*mcp.Server)
 }
 
 // inProcess serves relay calls without a network hop, stamping the virtual

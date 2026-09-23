@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -9,31 +8,17 @@ import (
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
+	"github.com/mvanhorn/agent-tincan/internal/store"
 )
 
-// TraceStep and AuditEvent mirror the relay's trace response.
-type TraceStep struct {
-	Request envelope.Request `json:"request"`
-	Status  envelope.Status  `json:"status"`
-	Reply   *envelope.Reply  `json:"reply,omitempty"`
-}
-
-type auditEvent struct {
-	Seq       int64           `json:"seq"`
-	At        json.RawMessage `json:"at"`
-	Event     string          `json:"event"`
-	RequestID string          `json:"request_id"`
-	Actor     string          `json:"actor"`
-	Detail    string          `json:"detail"`
-}
-
+// traceResp is the relay's trace response.
 type traceResp struct {
-	TraceID string       `json:"trace_id"`
-	Steps   []TraceStep  `json:"steps"`
-	Events  []auditEvent `json:"events"`
+	TraceID string             `json:"trace_id"`
+	Steps   []envelope.Result  `json:"steps"`
+	Events  []store.AuditEvent `json:"events"`
 }
 
-// adminFlags lets admin commands go through the local admin socket on the
+// adminRelay lets admin commands go through the local admin socket on the
 // relay host instead of the network.
 func adminRelay(socket, relayURL string) (*client.Relay, error) {
 	if socket != "" {
@@ -57,7 +42,7 @@ func traceCmd() *cobra.Command {
 			}
 			if len(args) == 0 {
 				var out struct {
-					Traces []TraceStep `json:"traces"`
+					Traces []envelope.Result `json:"traces"`
 				}
 				if err := r.Raw(cmd.Context(), "GET", fmt.Sprintf("/v1/trace?limit=%d", limit), nil, &out); err != nil {
 					return err

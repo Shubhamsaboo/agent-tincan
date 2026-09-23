@@ -93,6 +93,11 @@ func (s *Store) VerifyAudit(ctx context.Context) (checked int, err error) {
 	return checked, nil
 }
 
+// AuditEvents returns the whole audit log, oldest first.
+func (s *Store) AuditEvents(ctx context.Context) ([]AuditEvent, error) {
+	return s.auditWhere(ctx, "")
+}
+
 // AuditForTrace returns every audit entry for a trace, oldest first.
 func (s *Store) AuditForTrace(ctx context.Context, traceID string) ([]AuditEvent, error) {
 	return s.auditWhere(ctx, "WHERE trace_id = ?", traceID)
@@ -118,11 +123,7 @@ func (s *Store) auditWhere(ctx context.Context, where string, args ...any) ([]Au
 }
 
 // TraceStep is one request in a chain with its current state.
-type TraceStep struct {
-	Request envelope.Request `json:"request"`
-	Status  envelope.Status  `json:"status"`
-	Reply   *envelope.Reply  `json:"reply,omitempty"`
-}
+type TraceStep = envelope.Result
 
 // Trace returns every request in a chain, in the order they were sent.
 func (s *Store) Trace(ctx context.Context, traceID string) ([]TraceStep, error) {
@@ -146,11 +147,11 @@ func (s *Store) Trace(ctx context.Context, traceID string) ([]TraceStep, error) 
 		if err != nil {
 			return nil, err
 		}
-		res, err := s.Get(ctx, id, req.From)
+		rep, err := s.replyFor(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, TraceStep{Request: req, Status: st, Reply: res.Reply})
+		out = append(out, TraceStep{Request: req, Status: st, Reply: rep})
 	}
 	return out, nil
 }

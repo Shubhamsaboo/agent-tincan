@@ -17,6 +17,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"time"
+
+	"github.com/mvanhorn/agent-tincan/internal/identity"
 )
 
 const oauthSchema = `
@@ -53,6 +55,19 @@ const (
 
 var errInvalid = errors.New("invalid or expired")
 
+// Row kinds in gw_codes and gw_tokens.
+const (
+	kindLogin   = "login"
+	kindAuth    = "auth"
+	kindAccess  = "access"
+	kindRefresh = "refresh"
+)
+
+// codeRecord is what a consumed one-time code was bound to.
+type codeRecord struct {
+	Agent, ClientID, Redirect, Challenge string
+}
+
 // OAuth stores clients, one-time codes, and tokens. Only hashes of codes and
 // tokens are stored.
 type OAuth struct {
@@ -87,8 +102,8 @@ func hash(s string) string {
 // MintLoginCode creates the one-time code Matt types on the login page.
 func (o *OAuth) MintLoginCode(ctx context.Context, agent string) (string, error) {
 	code := shortCode()
-	_, err := o.db.ExecContext(ctx, `INSERT INTO gw_codes(hash, kind, agent, expires_at) VALUES (?, 'login', ?, ?)`,
-		hash(code), agent, o.now().Add(LoginCodeTTL).UnixMilli())
+	_, err := o.db.ExecContext(ctx, `INSERT INTO gw_codes(hash, kind, agent, expires_at) VALUES (?, ?, ?, ?)`,
+		hash(code), kindLogin, agent, o.now().Add(LoginCodeTTL).UnixMilli())
 	return code, err
 }
 
@@ -110,26 +125,27 @@ func (o *OAuth) ClientRedirects(ctx context.Context, clientID string) (string, e
 }
 
 // takeCode consumes a one-time code of the given kind.
-func (o *OAuth) takeCode(ctx context.Context, code, kind string) (agent, clientID, redirect, challenge string, err error) {
+func (o *OAuth) takeCode(ctx context.Context, code, kind string) (codeRecord, error) {
+	var r codeRecord
 	var exp int64
-	err = o.db.QueryRowContext(ctx, `DELETE FROM gw_codes WHERE hash = ? AND kind = ? RETURNING agent, client_id, redirect, challenge, expires_at`,
-		hash(code), kind).Scan(&agent, &clientID, &redirect, &challenge, &exp)
+	err := o.db.QueryRowContext(ctx, `DELETE FROM gw_codes WHERE hash = ? AND kind = ? RETURNING agent, client_id, redirect, challenge, expires_at`,
+		hash(code), kind).Scan(&r.Agent, &r.ClientID, &r.Redirect, &r.Challenge, &exp)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && o.now().UnixMilli() > exp) {
-		return "", "", "", "", errInvalid
+		return codeRecord{}, errInvalid
 	}
-	return agent, clientID, redirect, challenge, err
+	return r, err
 }
 
 // ExchangeLogin trades a login code for an authorization code bound to the
 // client, redirect URI, and PKCE challenge.
 func (o *OAuth) ExchangeLogin(ctx context.Context, loginCode, clientID, redirect, challenge string) (string, error) {
-	agent, _, _, _, err := o.takeCode(ctx, loginCode, "login")
+	login, err := o.takeCode(ctx, loginCode, kindLogin)
 	if err != nil {
 		return "", err
 	}
 	code := secret()
-	_, err = o.db.ExecContext(ctx, `INSERT INTO gw_codes(hash, kind, agent, client_id, redirect, challenge, expires_at) VALUES (?, 'auth', ?, ?, ?, ?, ?)`,
-		hash(code), agent, clientID, redirect, challenge, o.now().Add(authCodeTTL).UnixMilli())
+	_, err = o.db.ExecContext(ctx, `INSERT INTO gw_codes(hash, kind, agent, client_id, redirect, challenge, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		hash(code), kindAuth, login.Agent, clientID, redirect, challenge, o.now().Add(authCodeTTL).UnixMilli())
 	return code, err
 }
 
@@ -143,21 +159,21 @@ type Tokens struct {
 
 // ExchangeAuthCode verifies PKCE and issues tokens.
 func (o *OAuth) ExchangeAuthCode(ctx context.Context, code, clientID, redirect, verifier string) (Tokens, error) {
-	agent, cid, red, challenge, err := o.takeCode(ctx, code, "auth")
+	auth, err := o.takeCode(ctx, code, kindAuth)
 	if err != nil {
 		return Tokens{}, err
 	}
-	if cid != clientID || red != redirect || pkce(verifier) != challenge {
+	if auth.ClientID != clientID || auth.Redirect != redirect || pkce(verifier) != auth.Challenge {
 		return Tokens{}, errInvalid
 	}
-	return o.issue(ctx, agent, clientID)
+	return o.issue(ctx, auth.Agent, clientID)
 }
 
 // Refresh rotates a refresh token.
 func (o *OAuth) Refresh(ctx context.Context, refresh, clientID string) (Tokens, error) {
 	var agent, cid string
 	var exp int64
-	err := o.db.QueryRowContext(ctx, `DELETE FROM gw_tokens WHERE hash = ? AND kind = 'refresh' RETURNING agent, client_id, expires_at`, hash(refresh)).Scan(&agent, &cid, &exp)
+	err := o.db.QueryRowContext(ctx, `DELETE FROM gw_tokens WHERE hash = ? AND kind = ? RETURNING agent, client_id, expires_at`, hash(refresh), kindRefresh).Scan(&agent, &cid, &exp)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && (o.now().UnixMilli() > exp || cid != clientID)) {
 		return Tokens{}, errInvalid
 	}
@@ -173,7 +189,7 @@ func (o *OAuth) issue(ctx context.Context, agent, clientID string) (Tokens, erro
 	for _, row := range []struct {
 		tok, kind string
 		ttl       time.Duration
-	}{{t.AccessToken, "access", accessTTL}, {t.RefreshToken, "refresh", refreshTTL}} {
+	}{{t.AccessToken, kindAccess, accessTTL}, {t.RefreshToken, kindRefresh, refreshTTL}} {
 		if _, err := o.db.ExecContext(ctx, `INSERT INTO gw_tokens(hash, kind, agent, client_id, expires_at) VALUES (?, ?, ?, ?, ?)`,
 			hash(row.tok), row.kind, agent, clientID, now.Add(row.ttl).UnixMilli()); err != nil {
 			return Tokens{}, err
@@ -186,7 +202,7 @@ func (o *OAuth) issue(ctx context.Context, agent, clientID string) (Tokens, erro
 func (o *OAuth) Validate(ctx context.Context, access string) (string, error) {
 	var agent string
 	var exp int64
-	err := o.db.QueryRowContext(ctx, `SELECT agent, expires_at FROM gw_tokens WHERE hash = ? AND kind = 'access'`, hash(access)).Scan(&agent, &exp)
+	err := o.db.QueryRowContext(ctx, `SELECT agent, expires_at FROM gw_tokens WHERE hash = ? AND kind = ?`, hash(access), kindAccess).Scan(&agent, &exp)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && o.now().UnixMilli() > exp) {
 		return "", errInvalid
 	}
@@ -207,19 +223,10 @@ func pkce(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
-const codeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-
 func shortCode() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
+	code, err := identity.NewCode()
+	if err != nil {
 		panic(err)
 	}
-	out := make([]byte, 0, 9)
-	for i, c := range b {
-		if i == 4 {
-			out = append(out, '-')
-		}
-		out = append(out, codeAlphabet[int(c)%len(codeAlphabet)])
-	}
-	return string(out)
+	return code
 }

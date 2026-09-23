@@ -129,26 +129,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/requests/{id}/cancel", s.handleCancel)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
 	mux.HandleFunc("POST /v1/join", s.handleJoin)
+	s.adminRoutes(mux)
+	return limitBodies(mux)
+}
+
+// adminRoutes registers the routes served on both the tailnet API (for admin
+// devices) and the local admin socket. /v1/agents is added by the caller.
+func (s *Server) adminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
 	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
 	mux.HandleFunc("POST /v1/admin/connect", s.handleConnect)
 	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
 	mux.HandleFunc("GET /v1/trace", s.handleRecent)
 	mux.HandleFunc("GET /v1/admin/audit/verify", s.handleVerify)
-	return limitBodies(mux)
 }
 
 // AdminHandler serves only admin routes and treats every caller as the local
 // admin. Serve it on a unix socket on the relay host.
 func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
-	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
-	mux.HandleFunc("POST /v1/admin/connect", s.handleConnect)
-	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
-	mux.HandleFunc("GET /v1/trace", s.handleRecent)
-	mux.HandleFunc("GET /v1/admin/audit/verify", s.handleVerify)
+	s.adminRoutes(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), localAdminKey, true)))
 	})
@@ -188,7 +189,7 @@ func (s *Server) Sweep(ctx context.Context) {
 		if t.Status == envelope.StatusExpired {
 			event = "expired"
 		}
-		s.record(ctx, event, t.ID, "", "relay", "")
+		s.record(ctx, event, t.ID, t.TraceID, "relay", "")
 		s.hub.notify(requestKey(t.ID))
 		if t.Status == envelope.StatusQueued {
 			s.hub.notify(inboxKey(t.To))
@@ -196,8 +197,13 @@ func (s *Server) Sweep(ctx context.Context) {
 	}
 }
 
+func isLocalAdmin(ctx context.Context) bool {
+	v, _ := ctx.Value(localAdminKey).(bool)
+	return v
+}
+
 func (s *Server) remote(r *http.Request) string {
-	if v, _ := r.Context().Value(localAdminKey).(bool); v {
+	if isLocalAdmin(r.Context()) {
 		return identity.LocalAdmin
 	}
 	return r.RemoteAddr
@@ -283,8 +289,6 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusOK, map[string]any{"waiting": n})
 				return
 			}
-		}
-		if peek {
 			select {
 			case <-wake:
 				continue
@@ -376,7 +380,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, statusFor(err), err)
 			return
 		}
-		if done(res.Status) || wait == 0 {
+		if res.Done() || wait == 0 {
 			writeJSON(w, http.StatusOK, res)
 			return
 		}
@@ -406,14 +410,6 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": string(envelope.StatusCancelled)})
 }
 
-// AgentInfo is one row of the agent list.
-type AgentInfo struct {
-	Name     string    `json:"name"`
-	Online   bool      `json:"online"`
-	LastPoll time.Time `json:"last_poll,omitzero"`
-	Wake     string    `json:"wake"`
-}
-
 // WakeNamer reports an agent's wake method name. Set by package wake.
 type WakeNamer interface{ WakeMethod(agent string) string }
 
@@ -421,7 +417,7 @@ type WakeNamer interface{ WakeMethod(agent string) string }
 func (s *Server) SetWakeNamer(w WakeNamer) { s.wake = w }
 
 func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
-	if v, _ := r.Context().Value(localAdminKey).(bool); !v && s.agent(w, r) == "" {
+	if !isLocalAdmin(r.Context()) && s.agent(w, r) == "" {
 		return
 	}
 	agents, err := s.dir.Agents(r.Context())
@@ -430,11 +426,11 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.cfg.Now()
-	out := make([]AgentInfo, 0, len(agents))
+	out := make([]client.AgentInfo, 0, len(agents))
 	s.mu.Lock()
 	for _, a := range agents {
 		last := s.lastPoll[a.Name]
-		info := AgentInfo{Name: a.Name, LastPoll: last, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none"}
+		info := client.AgentInfo{Name: a.Name, LastPoll: last, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none"}
 		if s.wake != nil {
 			info.Wake = s.wake.WakeMethod(a.Name)
 		}
@@ -507,16 +503,8 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) isAgent(ctx context.Context, name string) bool {
-	agents, err := s.dir.Agents(ctx)
-	if err != nil {
-		return false
-	}
-	for _, a := range agents {
-		if a.Name == name {
-			return true
-		}
-	}
-	return false
+	ok, err := s.dir.Has(ctx, name)
+	return err == nil && ok
 }
 
 // record appends an audit entry. Audit failures are logged, never fatal: the
@@ -548,10 +536,6 @@ func (s *Server) touch(agent string) {
 	s.mu.Lock()
 	s.lastPoll[agent] = s.cfg.Now()
 	s.mu.Unlock()
-}
-
-func done(st envelope.Status) bool {
-	return st.Terminal() || st == envelope.StatusCancelled || st == envelope.StatusExpired
 }
 
 func durationParam(r *http.Request, key string, def, max time.Duration) time.Duration {
