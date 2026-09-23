@@ -76,6 +76,12 @@ type Requeuer interface {
 	Requeued(ctx context.Context, req envelope.Request)
 }
 
+// Replier is an optional Events extension told when a request gets its
+// reply, so the asker can be woken to read it. req.From is the asker.
+type Replier interface {
+	Replied(ctx context.Context, req envelope.Request)
+}
+
 // Server is the relay.
 type Server struct {
 	cfg    Config
@@ -132,6 +138,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/send", s.handleSend)
 	mux.HandleFunc("GET /v1/poll", s.handlePoll)
+	mux.HandleFunc("POST /v1/replies/ack", s.handleAckReplies)
 	mux.HandleFunc("POST /v1/requests/{id}/claim", s.handleClaim)
 	mux.HandleFunc("POST /v1/requests/{id}/reply", s.handleReply)
 	mux.HandleFunc("GET /v1/requests/{id}", s.handleGet)
@@ -303,6 +310,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, req)
 }
 
+// handlePoll holds a long-poll until requests for the caller, or unseen
+// replies to its own requests that it asked for, are waiting. No poll marks a
+// reply seen: replies=take and replies=keep both return unseen replies, and
+// a taking client acknowledges them through POST /v1/replies/ack once it has
+// handed them to its agent. Without a replies param (every client that
+// predates replies) they are left out and do not end the hold, as with
+// replies=none, since such a client would drop them. peek=1 only reports
+// what is waiting, and counts replies only with replies=keep or take.
 func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	name := s.agent(w, r)
 	if name == "" {
@@ -310,6 +325,15 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	}
 	hold := durationParam(r, "hold", s.cfg.PollHold, s.cfg.PollHold)
 	peek := r.URL.Query().Get("peek") == "1"
+	replies := r.URL.Query().Get("replies")
+	switch replies {
+	case "":
+		replies = client.RepliesNone
+	case client.RepliesTake, client.RepliesKeep, client.RepliesNone:
+	default:
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("replies must be %q, %q, or %q", client.RepliesTake, client.RepliesKeep, client.RepliesNone))
+		return
+	}
 	s.mu.Lock()
 	s.polling[name]++
 	s.mu.Unlock()
@@ -323,17 +347,33 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	for {
 		s.touch(name)
 		wake := s.hub.wait(inboxKey(name))
+		var reps []envelope.Result
+		var more int
+		if replies != client.RepliesNone {
+			var err error
+			if reps, more, err = s.unseenReplies(r.Context(), name); err != nil {
+				writeErr(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
 		if peek {
-			// Report how many are waiting without delivering them, so a
-			// listener can nudge the agent and the agent's own check_inbox
-			// still receives them.
+			// Report what is waiting without delivering it, so a listener
+			// can nudge the agent and the agent's own check_inbox still
+			// receives it. waiting counts the replies it was asked for.
 			n, err := s.store.CountQueued(r.Context(), name)
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, err)
 				return
 			}
-			if n > 0 {
-				writeJSON(w, http.StatusOK, map[string]any{"waiting": n})
+			if n > 0 || len(reps) > 0 {
+				out := map[string]any{"waiting": n + len(reps) + more, "queued": n}
+				if replies != client.RepliesNone {
+					out["replies"] = emptyIfNil(reps)
+				}
+				if more > 0 {
+					out["replies_remaining"] = more
+				}
+				writeJSON(w, http.StatusOK, out)
 				return
 			}
 			select {
@@ -351,11 +391,18 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		if len(reqs) > 0 {
+		if len(reqs) > 0 || len(reps) > 0 {
 			for _, q := range reqs {
 				s.record(r.Context(), "delivered", q.ID, q.TraceID, name, "")
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"requests": reqs})
+			out := map[string]any{"requests": emptyIfNil(reqs)}
+			if len(reps) > 0 {
+				out["replies"] = reps
+			}
+			if more > 0 {
+				out["replies_remaining"] = more
+			}
+			writeJSON(w, http.StatusOK, out)
 			return
 		}
 		select {
@@ -368,6 +415,79 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// MaxRepliesBytes bounds the request and reply bodies of the unseen replies
+// one poll returns, so a response stays well under the client's 4 MiB read
+// limit. A poll always returns at least one waiting reply; the rest wait for
+// the next poll, after the caller acknowledges this batch.
+const MaxRepliesBytes = 1 << 20
+
+// unseenReplies returns the oldest of agent's unseen replies that fit in
+// MaxRepliesBytes, and how many more are waiting beyond them.
+func (s *Server) unseenReplies(ctx context.Context, agent string) ([]envelope.Result, int, error) {
+	reps, err := s.store.UnseenReplies(ctx, agent)
+	if err != nil {
+		return nil, 0, err
+	}
+	cut := len(reps) == store.MaxUnseenReplies // the store may hold more
+	size := 0
+	for i, rep := range reps {
+		n := len(rep.Request.Body)
+		if rep.Reply != nil {
+			n += len(rep.Reply.Body)
+		}
+		if i > 0 && size+n > MaxRepliesBytes {
+			reps, cut = reps[:i], true
+			break
+		}
+		size += n
+	}
+	if !cut {
+		return reps, 0, nil
+	}
+	total, err := s.store.CountUnseenReplies(ctx, agent)
+	if err != nil {
+		return nil, 0, err
+	}
+	return reps, max(total-len(reps), 0), nil
+}
+
+// handleAckReplies marks replies the caller has handed to its agent as
+// seen. Ids that are not the caller's own requests, or that have no reply
+// yet, are ignored.
+func (s *Server) handleAckReplies(w http.ResponseWriter, r *http.Request) {
+	name := s.agent(w, r)
+	if name == "" {
+		return
+	}
+	var in struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("body must be {\"ids\": [...]}: %w", err))
+		return
+	}
+	if len(in.IDs) > maxAckIDs {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("at most %d ids per ack", maxAckIDs))
+		return
+	}
+	if err := s.store.MarkRepliesSeen(r.Context(), name, in.IDs); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxAckIDs caps one ack, well above the replies a poll returns.
+const maxAckIDs = 500
+
+// emptyIfNil keeps a JSON list a list rather than null.
+func emptyIfNil[T any](v []T) []T {
+	if v == nil {
+		return []T{}
+	}
+	return v
 }
 
 func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +528,16 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hub.notify(requestKey(id))
 	s.record(r.Context(), "replied", id, "", name, store.DetailJSON(map[string]any{"status": rep.Status}))
+	// The asker learns of the reply from a held poll now, or from a wake
+	// once the waker's grace period shows it went unread.
+	if req, _, err := s.store.Request(r.Context(), id); err == nil {
+		s.hub.notify(inboxKey(req.From))
+		if rp, ok := s.events.(Replier); ok {
+			rp.Replied(r.Context(), req)
+		}
+	} else {
+		log.Printf("reply %s: look up asker: %v", id, err)
+	}
 	writeJSON(w, http.StatusOK, rep)
 }
 
@@ -635,6 +765,20 @@ func (s *Server) Online(agent string) bool {
 	}
 	last := s.lastPoll[agent]
 	return !last.IsZero() && s.cfg.Now().Sub(last) < 5*time.Second
+}
+
+// UnseenReplies returns how many replies to agent's own requests it has not
+// read yet. The waker asks this when a reply's grace period ends. A failed
+// count reports one, since a spare nudge costs less than a missed reply.
+func (s *Server) UnseenReplies(agent string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, err := s.store.CountUnseenReplies(ctx, agent)
+	if err != nil {
+		log.Printf("unseen replies for %s: %v", agent, err)
+		return 1
+	}
+	return n
 }
 
 func (s *Server) touch(agent string) {

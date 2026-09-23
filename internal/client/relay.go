@@ -148,24 +148,81 @@ func (r *Relay) Ask(ctx context.Context, to, body, parent string, wait time.Dura
 	return r.Get(ctx, req.ID, wait)
 }
 
-// Poll waits up to hold for requests addressed to this agent. An empty slice
-// means nothing arrived in time.
-func (r *Relay) Poll(ctx context.Context, hold time.Duration) ([]envelope.Request, error) {
-	var out struct {
-		Requests []envelope.Request `json:"requests"`
-	}
-	err := r.call(ctx, r.polls, "GET", fmt.Sprintf("/v1/poll?hold=%d", int(hold.Seconds())), nil, &out)
-	return out.Requests, err
+// What a poll does with unseen replies to this agent's own requests. No
+// poll marks a reply seen; a client that shows replies to its agent
+// acknowledges them afterwards with AckReplies. A poll that names none of
+// these (every client that predates replies) is treated as RepliesNone.
+const (
+	RepliesTake = "take" // return them for the agent to read, then AckReplies (check_inbox)
+	RepliesKeep = "keep" // return them to count or announce, never acked (wait, peek)
+	RepliesNone = "none" // leave them out; they do not end the hold (channel)
+)
+
+// Inbox is what one poll picked up: requests addressed to this agent, and
+// replies to requests it sent that it has not seen yet.
+type Inbox struct {
+	Requests []envelope.Request `json:"requests"`
+	Replies  []Result           `json:"replies,omitempty"`
+	// RepliesRemaining counts unseen replies left out of this poll to keep
+	// the response small. They come with a later poll once these are acked.
+	RepliesRemaining int `json:"replies_remaining,omitempty"`
 }
 
-// Peek waits up to hold for requests without taking them, and returns how
-// many are waiting. Listeners use it so the agent's own check still gets them.
-func (r *Relay) Peek(ctx context.Context, hold time.Duration) (int, error) {
-	var out struct {
-		Waiting int `json:"waiting"`
+// Empty reports whether nothing arrived.
+func (in Inbox) Empty() bool { return len(in.Requests) == 0 && len(in.Replies) == 0 }
+
+// ReplyIDs returns the request ids of the replies in the inbox, for
+// AckReplies.
+func (in Inbox) ReplyIDs() []string {
+	ids := make([]string, len(in.Replies))
+	for i, r := range in.Replies {
+		ids[i] = r.Request.ID
 	}
-	err := r.call(ctx, r.polls, "GET", fmt.Sprintf("/v1/poll?peek=1&hold=%d", int(hold.Seconds())), nil, &out)
-	return out.Waiting, err
+	return ids
+}
+
+// Waiting is what a peek saw without taking anything.
+type Waiting struct {
+	Total   int      `json:"waiting"` // queued requests plus unseen replies
+	Queued  int      `json:"queued"`
+	Replies []Result `json:"replies,omitempty"`
+}
+
+// Poll waits up to hold for requests addressed to this agent or unseen
+// replies to its own requests. It takes the requests. The replies stay
+// unseen until the caller, having shown them to its agent, passes
+// in.ReplyIDs() to AckReplies. An empty Inbox means nothing arrived in time.
+func (r *Relay) Poll(ctx context.Context, hold time.Duration) (Inbox, error) {
+	return r.PollReplies(ctx, hold, RepliesTake)
+}
+
+// PollReplies is Poll with a choice of what happens to unseen replies
+// (RepliesTake, RepliesKeep, or RepliesNone).
+func (r *Relay) PollReplies(ctx context.Context, hold time.Duration, replies string) (Inbox, error) {
+	var out Inbox
+	path := fmt.Sprintf("/v1/poll?hold=%d&replies=%s", int(hold.Seconds()), url.QueryEscape(replies))
+	err := r.call(ctx, r.polls, "GET", path, nil, &out)
+	return out, err
+}
+
+// AckReplies marks the replies to the requests in ids as seen, once the
+// agent has been shown them. The relay ignores ids that are not this
+// agent's own requests. An empty ids makes no call.
+func (r *Relay) AckReplies(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return r.call(ctx, r.api, "POST", "/v1/replies/ack", map[string][]string{"ids": ids}, nil)
+}
+
+// Peek waits up to hold for requests or unseen replies without taking
+// either, and reports what is waiting. Listeners use it so the agent's own
+// check still gets them.
+func (r *Relay) Peek(ctx context.Context, hold time.Duration) (Waiting, error) {
+	var out Waiting
+	path := fmt.Sprintf("/v1/poll?peek=1&hold=%d&replies=%s", int(hold.Seconds()), RepliesKeep)
+	err := r.call(ctx, r.polls, "GET", path, nil, &out)
+	return out, err
 }
 
 // Claim marks a request as being handled by this agent.

@@ -35,6 +35,7 @@ type relayFlags struct {
 	admins      []string
 	adminLogins []string
 	noRebind    bool
+	replyGrace  time.Duration
 
 	gateway         bool
 	gatewayHostname string
@@ -57,7 +58,9 @@ the state dir and from machines named in --admin that carry no Tailscale tags
 (e.g. tag:agent) so they can never be admins.
 
 Wake settings (webhook URLs, email addresses, keys) live in wake.json in the
-state dir, chmod 600. They are never sent to agents.
+state dir, chmod 600. They are never sent to agents. A webhook or email agent
+is also woken when a reply to its own request is still unread after
+--reply-grace.
 
 A rebuilt machine (a new Tailscale node with the same machine name, or that
 name plus a "-1" style suffix) is re-admitted as its old agent on its first
@@ -73,6 +76,7 @@ off with --no-auto-rebind.`,
 	cmd.Flags().StringSliceVar(&f.admins, "admin", nil, "machine names allowed to run admin commands (e.g. macbook-pro-44,iphone182)")
 	cmd.Flags().StringSliceVar(&f.adminLogins, "admin-login", nil, "if set, admin machines must also be owned by one of these Tailscale logins")
 	cmd.Flags().BoolVar(&f.noRebind, "no-auto-rebind", false, "do not re-admit rebuilt machines automatically; they need a new invite")
+	cmd.Flags().DurationVar(&f.replyGrace, "reply-grace", wake.DefaultReplyGrace, "how long a reply may go unread before a webhook or email agent is woken to read it")
 	cmd.Flags().BoolVar(&f.gateway, "chatgpt-gateway", false, "serve the public ChatGPT MCP gateway through Tailscale Funnel (OAuth-protected)")
 	cmd.Flags().StringVar(&f.gatewayHostname, "gateway-hostname", "tincan-gateway", "tsnet node name for the Funnel gateway")
 	cmd.Flags().StringVar(&f.gatewayListen, "gateway-listen", "", "serve the gateway on this plain-HTTP address instead of Funnel (put your own TLS proxy in front)")
@@ -145,9 +149,12 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	if err != nil {
 		return err
 	}
-	waker := wake.New(wakeCfg, st, wake.Options{Online: srv.Online})
+	waker := wake.New(wakeCfg, st, wake.Options{Online: srv.Online, UnseenReplies: srv.UnseenReplies, ReplyGrace: f.replyGrace})
 	srv.SetEvents(waker)
 	srv.SetWakeNamer(waker)
+	if err := resumeReplyWakes(ctx, st, waker); err != nil {
+		log.Printf("reschedule reply wakes: %v", err) // replies stay unseen for the agent's next check
+	}
 	go srv.Run(ctx)
 
 	api := client.Configure(&http.Server{Handler: srv.Handler()}, client.RelayAPI)
@@ -236,4 +243,20 @@ func gatewayListener(ctx context.Context, f relayFlags) (net.Listener, string, f
 		return nil, "", nil, errors.New("no HTTPS domain for the gateway node; enable HTTPS certificates in the Tailscale admin console")
 	}
 	return ln, "https://" + domains[0], func() { ts.Close() }, nil
+}
+
+// resumeReplyWakes schedules a reply wake for every agent that still holds
+// unseen replies. The waker keeps its grace-period timers in memory, so
+// without this a relay restart inside the grace window would never wake the
+// asker. Each wake still waits out the grace period and is dropped if the
+// reply was read by then.
+func resumeReplyWakes(ctx context.Context, st *store.Store, w *wake.Waker) error {
+	agents, err := st.AgentsWithUnseenReplies(ctx)
+	if err != nil {
+		return err
+	}
+	for _, a := range agents {
+		w.ReplyWaiting(a)
+	}
+	return nil
 }

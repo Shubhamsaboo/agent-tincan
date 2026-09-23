@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
+	"github.com/mvanhorn/agent-tincan/internal/wake"
 )
 
 func connect() (*client.Relay, client.Config, error) {
@@ -239,44 +241,46 @@ func inboxCmd() *cobra.Command {
 	var wait time.Duration
 	cmd := &cobra.Command{
 		Use:   "inbox",
-		Short: "Get requests from teammates (claims them so no one else handles them)",
+		Short: "Get requests from teammates (claims them) and replies to your own requests",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			r, _, err := connect()
 			if err != nil {
 				return err
 			}
-			out, err := checkInbox(cmd.Context(), r, client.ClampWait(wait))
-			if err != nil {
-				return err
-			}
-			cmd.Print(out)
-			return nil
+			return checkInbox(cmd.Context(), r, client.ClampWait(wait), cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().DurationVar(&wait, "wait", 0, "wait up to this long for a request (max 20s)")
 	return cmd
 }
 
-// checkInbox polls once, claims what arrived, and renders it.
-func checkInbox(ctx context.Context, r *client.Relay, wait time.Duration) (string, error) {
-	reqs, err := r.Poll(ctx, wait)
+// checkInbox polls once, claims what arrived, prints it to out, and only
+// then acknowledges the replies it printed, so a reply lost on the way (a
+// dropped connection, a crash before printing) shows again next time. A
+// failed ack is reported on errOut; the replies may show again.
+func checkInbox(ctx context.Context, r *client.Relay, wait time.Duration, out, errOut io.Writer) error {
+	in, err := r.Poll(ctx, wait)
 	if err != nil {
-		return "", err
+		return err
 	}
-	return claimAndFormat(ctx, r, reqs), nil
+	if _, err := io.WriteString(out, client.FormatInbox(ctx, r, in)); err != nil {
+		return err
+	}
+	if err := r.AckReplies(ctx, in.ReplyIDs()); err != nil {
+		fmt.Fprintf(errOut, "tincan inbox: could not mark replies read (they may show again): %v\n", err)
+	}
+	return nil
 }
 
-func claimAndFormat(ctx context.Context, r *client.Relay, reqs []envelope.Request) string {
-	if len(reqs) == 0 {
-		return "No requests waiting.\n"
-	}
+// formatWait renders what ended a wait: the requests, claimed, and a count of
+// replies to the agent's own requests, which stay unseen for check_inbox.
+func formatWait(ctx context.Context, r *client.Relay, in client.Inbox) string {
 	var b strings.Builder
-	for _, req := range reqs {
-		if _, err := r.Claim(ctx, req.ID); err != nil {
-			fmt.Fprintf(&b, "(could not claim %s: %v)\n", req.ID, err)
-			continue
-		}
-		b.WriteString(client.FormatRequest(req))
+	if len(in.Requests) > 0 {
+		b.WriteString(client.FormatInbox(ctx, r, client.Inbox{Requests: in.Requests}))
+	}
+	if len(in.Replies) > 0 {
+		b.WriteString(wake.WaitingMessage(0, len(in.Replies)) + "\n")
 	}
 	return b.String()
 }
@@ -327,12 +331,14 @@ func waitCmd() *cobra.Command {
 	var limit time.Duration
 	cmd := &cobra.Command{
 		Use:   "wait",
-		Short: "Block until a teammate's request arrives, print it, and exit",
-		Long: `Block until a request arrives, claim and print it, then exit.
+		Short: "Block until a teammate's request or a reply to your own request arrives, print it, and exit",
+		Long: `Block until a request arrives, claim and print it, then exit. A reply to
+one of your own requests also ends the wait: it prints a count and leaves the
+reply for check_inbox (or "tincan inbox") to show.
 
 For agents that get a new turn when a background command finishes (like
-Muse): run "tincan wait &" and the arriving request wakes you. Start it again
-after handling the request. Network errors are retried with backoff, so a
+Muse): run "tincan wait &" and the arriving request or reply wakes you. Start
+it again after handling it. Network errors are retried with backoff, so a
 flaky tailnet path does not end the wait.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			r, _, err := connect()
@@ -345,11 +351,11 @@ flaky tailnet path does not end the wait.`,
 				ctx, cancel = context.WithTimeout(ctx, limit)
 				defer cancel()
 			}
-			reqs, err := waitForRequests(ctx, r, client.DefaultPollHold)
+			in, err := waitForInbox(ctx, r, client.DefaultPollHold, client.RepliesKeep)
 			if err != nil {
 				return err
 			}
-			cmd.Print(claimAndFormat(cmd.Context(), r, reqs))
+			cmd.Print(formatWait(cmd.Context(), r, in))
 			return nil
 		},
 	}
@@ -357,27 +363,28 @@ flaky tailnet path does not end the wait.`,
 	return cmd
 }
 
-// waitForRequests long-polls until something arrives, retrying transient
-// errors with jittered backoff. It gives up only on ctx or a hard refusal
+// waitForInbox long-polls until requests or unseen replies arrive (replies
+// says what the poll does with replies), retrying transient errors with
+// jittered backoff. It gives up only on ctx or a hard refusal
 // (for example, this machine is not a joined agent).
-func waitForRequests(ctx context.Context, r *client.Relay, hold time.Duration) ([]envelope.Request, error) {
+func waitForInbox(ctx context.Context, r *client.Relay, hold time.Duration, replies string) (client.Inbox, error) {
 	backoff := time.Second
 	for {
-		reqs, err := r.Poll(ctx, hold)
+		in, err := r.PollReplies(ctx, hold, replies)
 		switch {
-		case err == nil && len(reqs) > 0:
-			return reqs, nil
+		case err == nil && !in.Empty():
+			return in, nil
 		case err == nil:
 			backoff = time.Second
 			continue
 		case ctx.Err() != nil:
-			return nil, ctx.Err()
+			return client.Inbox{}, ctx.Err()
 		case client.IsStatus(err, 403):
-			return nil, err
+			return client.Inbox{}, err
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return client.Inbox{}, ctx.Err()
 		case <-time.After(jitter(backoff)):
 		}
 		backoff = min(backoff*2, 30*time.Second)

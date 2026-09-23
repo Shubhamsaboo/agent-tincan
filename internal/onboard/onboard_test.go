@@ -231,7 +231,7 @@ func TestFreshSessionRulesAndSecretFields(t *testing.T) {
 	}})
 	for _, n := range []string{"hermes", "openclaw", "codex"} {
 		txt := block(t, k, n).Instructions
-		if !strings.Contains(txt, "drain the whole inbox") || !strings.Contains(txt, "synchronous") {
+		if !strings.Contains(txt, "drain the whole inbox") || !strings.Contains(txt, "woken when a reply arrives") {
 			t.Errorf("%s block lacks fresh-session rules:\n%s", n, txt)
 		}
 	}
@@ -240,6 +240,30 @@ func TestFreshSessionRulesAndSecretFields(t *testing.T) {
 	}
 	if !strings.Contains(blockText(block(t, k, "openclaw")), "bearer_token") {
 		t.Error("openclaw block should name bearer_token")
+	}
+}
+
+// Replies to a fresh-session agent's own asks wake it now, so its block must
+// say so and drop the old advice to treat every ask as synchronous.
+func TestFreshSessionReplyWakeGuidance(t *testing.T) {
+	k := build(t, Options{RelayURL: relayURL, Roster: []Member{
+		{Name: "hermes", Wake: "webhook"}, {Name: "openclaw", Wake: "webhook"}, {Name: "codex", Wake: "command"},
+	}})
+	for _, n := range []string{"hermes", "openclaw", "codex"} {
+		txt := block(t, k, n).Instructions
+		for _, want := range []string{"may return before", "woken when a reply arrives", "check_inbox shows replies to your requests", "finish the work that was waiting on it"} {
+			if !strings.Contains(txt, want) {
+				t.Errorf("%s block missing %q:\n%s", n, want, txt)
+			}
+		}
+		for _, stale := range []string{"synchronous", "does not wake you"} {
+			if strings.Contains(txt, stale) {
+				t.Errorf("%s block still says %q:\n%s", n, stale, txt)
+			}
+		}
+	}
+	if setup := blockText(block(t, k, "codex")); !strings.Contains(setup, "requests or replies are waiting") {
+		t.Errorf("codex listener prompt should cover replies:\n%s", setup)
 	}
 }
 
@@ -293,5 +317,36 @@ func TestRenderSections(t *testing.T) {
 	all := Render(k, "all")
 	if !strings.Contains(all, op) || !strings.Contains(all, rc) {
 		t.Error("all should contain every section")
+	}
+}
+
+// tincan wait also exits for a reply to the agent's own request, printing a
+// count rather than a request, so wait-method instructions must say what to
+// do then. Relay-side wakes carry replies too, so their blocks say so.
+func TestWakeBlocksMentionReplies(t *testing.T) {
+	k := build(t, Options{RelayURL: relayURL, Roster: []Member{
+		{Name: "muse", Wake: "wait", Kind: "proxy-sandbox"},
+		{Name: "zed", Wake: "wait"},
+		{Name: "grokbot", Wake: "webhook", Kind: "vm-webhook"},
+		{Name: "instinct", Wake: "email", Kind: "e2b-email"},
+		{Name: "hook", Wake: "webhook"},
+		{Name: "mail", Wake: "email"},
+		{Name: "claude-code", Wake: "channel", Kind: "claude-code"},
+	}})
+	for _, n := range []string{"muse", "zed"} {
+		txt := block(t, k, n).Instructions
+		for _, want := range []string{"a count of replies to your own requests", "tincan inbox", "finish the work that was waiting", "start tincan wait & again"} {
+			if !strings.Contains(txt, want) {
+				t.Errorf("%s wait block missing %q:\n%s", n, want, txt)
+			}
+		}
+		if strings.Contains(txt, "it prints a teammate's request:") {
+			t.Errorf("%s wait block still says the wait only ends with a request:\n%s", n, txt)
+		}
+	}
+	for _, n := range []string{"grokbot", "instinct", "hook", "mail", "claude-code"} {
+		if txt := block(t, k, n).Instructions; !strings.Contains(txt, "reply to your own request") {
+			t.Errorf("%s block should say a wake can mean a reply to its own request:\n%s", n, txt)
+		}
 	}
 }
