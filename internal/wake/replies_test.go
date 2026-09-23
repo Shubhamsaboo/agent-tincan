@@ -3,6 +3,8 @@ package wake
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -37,7 +39,7 @@ func TestReplyNudgeFiresAfterGraceWhenUnseen(t *testing.T) {
 	st := auditStore(t)
 	var n atomic.Int32
 	n.Store(1)
-	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, st, Options{ReplyGrace: 150 * time.Millisecond, UnseenReplies: unseen(&n)})
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, st, Options{ReplyGrace: 150 * time.Millisecond, UnseenReplies: unseen(&n), ReplyRetries: noRetries})
 	replied(w, "hermes")
 	time.Sleep(30 * time.Millisecond)
 	if rc.count() != 0 {
@@ -64,7 +66,7 @@ func TestReplyNudgeSuppressedWhenReadWithinGrace(t *testing.T) {
 	ts := rc.server(t)
 	var n atomic.Int32
 	n.Store(1)
-	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil, Options{ReplyGrace: 50 * time.Millisecond, UnseenReplies: unseen(&n)})
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil, Options{ReplyGrace: 50 * time.Millisecond, UnseenReplies: unseen(&n), ReplyRetries: noRetries})
 	replied(w, "hermes")
 	n.Store(0) // the asker's inline wait read it
 	w.Flush()
@@ -81,7 +83,7 @@ func TestReplyNudgeIgnoresOnline(t *testing.T) {
 	var n atomic.Int32
 	n.Store(1)
 	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil,
-		Options{ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), Online: func(string) bool { return true }})
+		Options{ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), ReplyRetries: noRetries, Online: func(string) bool { return true }})
 	replied(w, "hermes")
 	w.Flush()
 	if rc.count() != 1 {
@@ -98,7 +100,7 @@ func TestReplyAndRequestCoalesceIntoOneNudge(t *testing.T) {
 			ts := rc.server(t)
 			var n atomic.Int32
 			w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil,
-				Options{Debounce: 50 * time.Millisecond, ReplyGrace: 200 * time.Millisecond, UnseenReplies: unseen(&n)})
+				Options{Debounce: 50 * time.Millisecond, ReplyGrace: 200 * time.Millisecond, UnseenReplies: unseen(&n), ReplyRetries: noRetries})
 			want := WaitingMessage(1, 1)
 			switch order {
 			case "reply-first":
@@ -135,7 +137,7 @@ func TestRequestDoesNotWaitForReplyGrace(t *testing.T) {
 	var n atomic.Int32
 	n.Store(1)
 	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil,
-		Options{Debounce: 10 * time.Millisecond, ReplyGrace: time.Hour, UnseenReplies: unseen(&n)})
+		Options{Debounce: 10 * time.Millisecond, ReplyGrace: time.Hour, UnseenReplies: unseen(&n), ReplyRetries: noRetries})
 	replied(w, "hermes")
 	start := time.Now()
 	queued(w, "hermes", 1)
@@ -157,7 +159,7 @@ func TestReplyNudgeRespectsHourlyCap(t *testing.T) {
 	var n atomic.Int32
 	n.Store(1)
 	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL, MaxPerHour: 1}}, st,
-		Options{Debounce: time.Millisecond, ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), Now: func() time.Time { return now }})
+		Options{Debounce: time.Millisecond, ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), ReplyRetries: noRetries, Now: func() time.Time { return now }})
 	queued(w, "hermes", 1)
 	w.Flush()
 	replied(w, "hermes")
@@ -178,7 +180,7 @@ func TestReplyNudgeOnlyForRelaySideMethods(t *testing.T) {
 	var n atomic.Int32
 	n.Store(1)
 	w := New(Config{"muse": {Method: Wait}, "claude-code": {Method: Channel}, "codex": {Method: Command}}, nil,
-		Options{ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), AgentMailAPI: ts.URL})
+		Options{ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), ReplyRetries: noRetries, AgentMailAPI: ts.URL})
 	for _, asker := range []string{"muse", "claude-code", "codex", "chatgpt"} {
 		replied(w, asker)
 	}
@@ -196,7 +198,7 @@ func TestReplyNudgeByEmail(t *testing.T) {
 	var n atomic.Int32
 	n.Store(2)
 	w := New(Config{"instinct": {Method: Email, EmailTo: "agent@example.com", AgentMailFrom: "bot@agentmail.to", AgentMailKey: "k"}}, nil,
-		Options{ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), AgentMailAPI: ts.URL + "/v0"})
+		Options{ReplyGrace: time.Millisecond, UnseenReplies: unseen(&n), ReplyRetries: noRetries, AgentMailAPI: ts.URL + "/v0"})
 	replied(w, "instinct")
 	w.Flush()
 	if rc.count() != 1 {
@@ -222,5 +224,172 @@ func TestWaitingMessage(t *testing.T) {
 		if got := WaitingMessage(tc.requests, tc.replies); got != tc.want {
 			t.Errorf("WaitingMessage(%d, %d) = %q, want %q", tc.requests, tc.replies, got, tc.want)
 		}
+	}
+}
+
+// noRetries turns off reply follow-ups for tests that count a single nudge.
+var noRetries = []time.Duration{}
+
+// A reply that stays unseen after its nudge is nudged again on each step of
+// the retry schedule, then the retries stop.
+func TestReplyRetriesWhileUnseenThenStop(t *testing.T) {
+	var rc recorder
+	ts := rc.server(t)
+	st := auditStore(t)
+	var n atomic.Int32
+	n.Store(1)
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, st,
+		Options{ReplyGrace: time.Millisecond, ReplyRetries: []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}, UnseenReplies: unseen(&n)})
+	replied(w, "hermes")
+	w.Flush()
+	if rc.count() != 3 {
+		t.Fatalf("wakes = %d, want the first nudge plus 2 retries", rc.count())
+	}
+	for i, b := range rc.bodies {
+		if got := message(t, b); got != WaitingMessage(0, 1) || strings.Contains(b, "SECRET") {
+			t.Fatalf("wake %d message = %q", i, got)
+		}
+	}
+	if got := strings.Join(events(t, st), ","); got != "woke,woke,woke" {
+		t.Fatalf("audit = %s", got)
+	}
+}
+
+// Once the asker reads the reply, the pending retry finds nothing unseen and
+// the schedule ends.
+func TestReplyRetriesStopWhenSeen(t *testing.T) {
+	var rc recorder
+	ts := rc.server(t)
+	var n atomic.Int32
+	n.Store(1)
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil,
+		Options{ReplyGrace: time.Millisecond, ReplyRetries: []time.Duration{300 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond}, UnseenReplies: unseen(&n)})
+	replied(w, "hermes")
+	deadline := time.Now().Add(5 * time.Second)
+	for rc.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	n.Store(0) // the woken session read it
+	w.Flush()
+	if rc.count() != 1 {
+		t.Fatalf("wakes = %d, want 1: the reply was read before the first retry", rc.count())
+	}
+}
+
+// Retries count against the hourly budget like every other relay-side wake.
+func TestReplyRetriesRespectHourlyCap(t *testing.T) {
+	var rc recorder
+	ts := rc.server(t)
+	st := auditStore(t)
+	now := time.Unix(1_790_000_000, 0)
+	var n atomic.Int32
+	n.Store(1)
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL, MaxPerHour: 2}}, st,
+		Options{ReplyGrace: time.Millisecond, ReplyRetries: []time.Duration{5 * time.Millisecond, 5 * time.Millisecond, 5 * time.Millisecond},
+			UnseenReplies: unseen(&n), Now: func() time.Time { return now }})
+	replied(w, "hermes")
+	w.Flush()
+	if rc.count() != 2 {
+		t.Fatalf("wakes = %d, want 2 under a cap of 2", rc.count())
+	}
+	if got := strings.Join(events(t, st), ","); got != "woke,woke,wake_skipped,wake_skipped" {
+		t.Fatalf("audit = %s", got)
+	}
+}
+
+// A request that lands while a retry is pending coalesces with it into one
+// nudge counting both, and the schedule carries on after it.
+func TestReplyRetryCoalescesWithRequest(t *testing.T) {
+	var rc recorder
+	ts := rc.server(t)
+	var n atomic.Int32
+	n.Store(1)
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil,
+		Options{Debounce: 5 * time.Millisecond, ReplyGrace: time.Millisecond, ReplyRetries: []time.Duration{time.Hour, 10 * time.Millisecond},
+			UnseenReplies: unseen(&n)})
+	replied(w, "hermes")
+	deadline := time.Now().Add(5 * time.Second)
+	for rc.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	queued(w, "hermes", 1) // pulls the hour-long retry in to the debounce
+	w.Flush()
+	if rc.count() != 3 {
+		t.Fatalf("wakes = %d, want reply, request+reply, final retry", rc.count())
+	}
+	if got := message(t, rc.bodies[1]); got != WaitingMessage(1, 1) {
+		t.Fatalf("coalesced message = %q", got)
+	}
+	if got := message(t, rc.bodies[2]); got != WaitingMessage(0, 1) {
+		t.Fatalf("last retry message = %q", got)
+	}
+}
+
+func TestDefaultReplyRetries(t *testing.T) {
+	w := New(Config{}, nil, Options{})
+	want := []time.Duration{5 * time.Minute, 20 * time.Minute, time.Hour}
+	if len(w.opts.ReplyRetries) != len(want) {
+		t.Fatalf("retries = %v, want %v", w.opts.ReplyRetries, want)
+	}
+	for i := range want {
+		if w.opts.ReplyRetries[i] != want[i] {
+			t.Fatalf("retries = %v, want %v", w.opts.ReplyRetries, want)
+		}
+	}
+}
+
+// A fresh reply that lands while an earlier nudge is still being sent earns
+// the full follow-up schedule: the earlier nudge's stale follow-up must not
+// push it past its first step.
+func TestFreshReplyDuringSlowSendKeepsFirstFollowUp(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release // the first send is slow
+		}
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(ts.Close)
+	var n atomic.Int32
+	n.Store(1)
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, nil,
+		Options{ReplyGrace: 100 * time.Millisecond, ReplyRetries: []time.Duration{10 * time.Millisecond, 10 * time.Millisecond}, UnseenReplies: unseen(&n)})
+	replied(w, "hermes")
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first nudge never sent")
+	}
+	n.Store(2)
+	replied(w, "hermes") // a fresh reply while the first send is in flight
+	close(release)
+	w.Flush()
+	// First nudge, the fresh reply's nudge, then both of its follow-ups.
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("wakes = %d, want 4: the fresh reply lost a follow-up step", got)
+	}
+}
+
+// A nudge whose webhook send fails still schedules the follow-up, which
+// reaches the agent once the webhook recovers.
+func TestFailedReplyNudgeStillFollowsUp(t *testing.T) {
+	var rc recorder
+	rc.fail.Store(2) // the send and its single retry both fail
+	ts := rc.server(t)
+	st := auditStore(t)
+	var n atomic.Int32
+	n.Store(1)
+	w := New(Config{"hermes": {Method: Webhook, URL: ts.URL}}, st,
+		Options{ReplyGrace: time.Millisecond, RetryDelay: time.Millisecond, ReplyRetries: []time.Duration{10 * time.Millisecond}, UnseenReplies: unseen(&n)})
+	replied(w, "hermes")
+	w.Flush()
+	if rc.count() != 3 {
+		t.Fatalf("webhook calls = %d, want 2 failed attempts plus the follow-up", rc.count())
+	}
+	if got := strings.Join(events(t, st), ","); got != "wake_failed,woke" {
+		t.Fatalf("audit = %s", got)
 	}
 }
