@@ -585,3 +585,58 @@ func TestLocalAdminSocketCanSetKind(t *testing.T) {
 		t.Fatalf("kinds = %v", k)
 	}
 }
+
+type queuedRecorder struct {
+	mu sync.Mutex
+	to []string
+}
+
+func (q *queuedRecorder) Queued(_ context.Context, req envelope.Request) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.to = append(q.to, req.To)
+}
+
+// A relay-woken agent (webhook or email) that claims a request and then
+// times out has no poller waiting, so the requeue must fire the wake again
+// or the request sits until something unrelated wakes the agent.
+func TestSweepRequeueWakesAgainForRelayWake(t *testing.T) {
+	h := newHarness(t, Config{DeliveryLease: time.Millisecond})
+	rec := &queuedRecorder{}
+	h.srv.SetEvents(rec)
+	h.send(grokAddr, "muse", "x")
+	h.do(museAddr, "GET", "/v1/poll?hold=0", "", http.StatusOK, nil) // delivered, never claimed
+	time.Sleep(10 * time.Millisecond)
+	h.srv.Sweep(context.Background())
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.to) != 2 || rec.to[1] != "muse" {
+		t.Fatalf("wake events = %v, want the original queue and one for the requeue", rec.to)
+	}
+}
+
+type requeueRecorder struct {
+	queuedRecorder
+	requeued []string
+}
+
+func (q *requeueRecorder) Requeued(_ context.Context, req envelope.Request) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.requeued = append(q.requeued, req.To)
+}
+
+func TestSweepPrefersRequeuedHook(t *testing.T) {
+	h := newHarness(t, Config{DeliveryLease: time.Millisecond})
+	rec := &requeueRecorder{}
+	h.srv.SetEvents(rec)
+	h.send(grokAddr, "muse", "x")
+	h.do(museAddr, "GET", "/v1/poll?hold=0", "", http.StatusOK, nil)
+	time.Sleep(10 * time.Millisecond)
+	h.srv.Sweep(context.Background())
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.to) != 1 || len(rec.requeued) != 1 || rec.requeued[0] != "muse" {
+		t.Fatalf("queued = %v, requeued = %v; want the requeue to use Requeued", rec.to, rec.requeued)
+	}
+}
