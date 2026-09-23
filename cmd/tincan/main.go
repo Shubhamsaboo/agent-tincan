@@ -3,18 +3,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+
+	"github.com/mvanhorn/agent-tincan/internal/cli"
 )
 
 // Version is set at link time by the release build.
 var Version = "0.0.1-dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Println(Version)
-		return
+	cli.Version = Version
+	if err := cli.Root().ExecuteContext(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "tincan:", err)
+		os.Exit(1)
 	}
-	fmt.Fprintln(os.Stderr, "usage: tincan <command>")
-	os.Exit(2)
 }
