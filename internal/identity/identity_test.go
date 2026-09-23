@@ -177,8 +177,61 @@ func TestOneMachineOneAgent(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	f.dir.Join(ctx, "100.0.0.4:1", f.invite(t, "muse"))
-	if _, err := f.dir.Join(ctx, "100.0.0.4:1", f.invite(t, "muse2")); !errors.Is(err, identity.ErrNodeTaken) {
+	code := f.invite(t, "muse2")
+	if _, err := f.dir.Join(ctx, "100.0.0.4:1", code); !errors.Is(err, identity.ErrNodeTaken) {
 		t.Fatalf("second name on same node: want ErrNodeTaken, got %v", err)
+	}
+	// The rejected attempt must not burn the code: the right machine can still use it.
+	if got, err := f.dir.Join(ctx, "100.0.0.3:1", code); err != nil || got != "muse2" {
+		t.Fatalf("join after rejected attempt: got %q, %v", got, err)
+	}
+	if _, err := f.dir.Join(ctx, "100.0.0.2:1", code); !errors.Is(err, identity.ErrBadInvite) {
+		t.Fatalf("code reused after successful join: want ErrBadInvite, got %v", err)
+	}
+}
+
+// adminFixture resolves admin-named nodes with varying tags and owners.
+func adminFixture(t *testing.T, adminLogins []string) *identity.Directory {
+	t.Helper()
+	who := identitytest.New(map[string]identity.Node{
+		"100.0.1.1:1": {ID: "nA", Name: "macbook-pro-44", User: "mvanhorn@gmail.com"},
+		"100.0.1.2:1": {ID: "nB", Name: "macbook-pro-44", User: "mvanhorn@gmail.com", Tags: []string{"tag:agent"}},
+		"100.0.1.3:1": {ID: "nC", Name: "macbook-pro-44", User: "someone-else@example.com"},
+	})
+	return identity.NewDirectory(identity.NewMemoryStore(), who, identity.Config{
+		Admins:      []string{"macbook-pro-44"},
+		AdminLogins: adminLogins,
+	})
+}
+
+// A tagged node never has admin rights, even if it carries an admin's name.
+func TestTaggedNodeWithAdminNameIsNotAdmin(t *testing.T) {
+	dir := adminFixture(t, nil)
+	ctx := context.Background()
+	if !dir.IsAdmin(ctx, "100.0.1.1:1") {
+		t.Fatal("untagged admin-named node should be admin")
+	}
+	if dir.IsAdmin(ctx, "100.0.1.2:1") {
+		t.Fatal("tagged admin-named node must not be admin")
+	}
+	if _, err := dir.Invite(ctx, "100.0.1.2:1", "evil"); !errors.Is(err, identity.ErrNotAdmin) {
+		t.Fatalf("invite from tagged node: want ErrNotAdmin, got %v", err)
+	}
+}
+
+// With --admin-login set, the node's owning login must also match.
+func TestAdminLoginRestrictsOwner(t *testing.T) {
+	dir := adminFixture(t, []string{"mvanhorn@gmail.com"})
+	ctx := context.Background()
+	if !dir.IsAdmin(ctx, "100.0.1.1:1") {
+		t.Fatal("admin-named node owned by the listed login should be admin")
+	}
+	if dir.IsAdmin(ctx, "100.0.1.3:1") {
+		t.Fatal("admin-named node owned by another login must not be admin")
+	}
+	// Without AdminLogins, ownership is not checked.
+	if !adminFixture(t, nil).IsAdmin(ctx, "100.0.1.3:1") {
+		t.Fatal("without AdminLogins an untagged admin-named node is admin")
 	}
 }
 

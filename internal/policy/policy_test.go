@@ -151,3 +151,44 @@ func TestRateLimit(t *testing.T) {
 		t.Fatalf("after the window: %v", err)
 	}
 }
+
+// An agent handling two requests at once has no single chain to continue, so
+// a parentless ask starts a new chain instead of guessing (and must not be
+// rejected as a cycle against the chain it guessed).
+func TestTwoOpenClaimsStartNewChain(t *testing.T) {
+	f := newFixture(t, Config{})
+	a, _ := f.send(t, "grokbot", "muse", "")
+	f.claim(t, a.ID, "muse")
+	b, _ := f.send(t, "instinct", "muse", "")
+	f.claim(t, b.ID, "muse")
+	// Guessing either chain is wrong; guessing b's would also reject this as a cycle.
+	req, err := f.send(t, "muse", "instinct", "")
+	if err != nil {
+		t.Fatalf("parentless ask with two open claims: %v", err)
+	}
+	if req.Hop != 1 || req.ParentID != "" || req.TraceID != req.ID {
+		t.Fatalf("want a new chain, got %+v", req)
+	}
+}
+
+// A notify the agent claimed long ago never closes, so it must not become the
+// implicit parent of the agent's later asks.
+func TestClaimedNotifyIsNotImplicitParent(t *testing.T) {
+	f := newFixture(t, Config{})
+	n := envelope.Request{From: "grokbot", To: "muse", Kind: envelope.KindNotify, Body: "fyi"}
+	if err := f.pol.Prepare(context.Background(), &n); err != nil {
+		t.Fatal(err)
+	}
+	n, err := f.st.Enqueue(context.Background(), n, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.claim(t, n.ID, "muse")
+	req, err := f.send(t, "muse", "grokbot", "")
+	if err != nil {
+		t.Fatalf("ask after a claimed notify: %v", err)
+	}
+	if req.Hop != 1 || req.ParentID != "" {
+		t.Fatalf("stale notify became the parent: %+v", req)
+	}
+}

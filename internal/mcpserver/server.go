@@ -46,6 +46,7 @@ type askIn struct {
 	Message     string `json:"message" jsonschema:"what you want them to do or answer"`
 	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"seconds to wait for the reply, 0 to 20 (default 20)"`
 	Notify      bool   `json:"notify,omitempty" jsonschema:"true to send without expecting a reply"`
+	ParentID    string `json:"parent_id,omitempty" jsonschema:"the request id you are handling, when this ask continues it"`
 }
 
 type idIn struct {
@@ -85,7 +86,7 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Ser
 	mcp.AddTool(s, &mcp.Tool{Name: "ask", Description: "Ask a teammate agent to do something or answer something. Waits up to wait_seconds for the reply, otherwise returns a request id to check with get_reply."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, any, error) {
 			if in.Notify {
-				req, err := b.Send(ctx, in.To, in.Message, envelope.KindNotify, "")
+				req, err := b.Send(ctx, in.To, in.Message, envelope.KindNotify, in.ParentID)
 				if err != nil {
 					return fail(err)
 				}
@@ -95,7 +96,7 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Ser
 			if in.WaitSeconds != 0 {
 				wait = clamp(in.WaitSeconds)
 			}
-			res, err := b.Ask(ctx, in.To, in.Message, "", wait)
+			res, err := b.Ask(ctx, in.To, in.Message, in.ParentID, wait)
 			if err != nil {
 				return fail(err)
 			}
@@ -175,7 +176,13 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Ser
 	mcp.AddTool(s, &mcp.Tool{Name: "trace", Description: "Show a request chain you took part in: who asked whom, in order, with status and replies."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in traceIn) (*mcp.CallToolResult, any, error) {
 			var tr struct {
-				Steps []envelope.Result `json:"steps"`
+				Steps  []envelope.Result `json:"steps"`
+				Events []struct {
+					Seq       int64  `json:"seq"`
+					Event     string `json:"event"`
+					Actor     string `json:"actor"`
+					RequestID string `json:"request_id"`
+				} `json:"events"`
 			}
 			if err := b.Raw(ctx, "GET", "/v1/trace/"+url.PathEscape(in.TraceID), nil, &tr); err != nil {
 				return fail(err)
@@ -185,6 +192,12 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Ser
 				fmt.Fprintf(&out, "hop %d: %s -> %s [%s]: %s\n", st.Request.Hop, st.Request.From, st.Request.To, st.Status, st.Request.Body)
 				if st.Reply != nil {
 					fmt.Fprintf(&out, "  reply from %s: %s\n", st.Reply.From, st.Reply.Body)
+				}
+			}
+			if len(tr.Events) > 0 {
+				out.WriteString("Events:\n")
+				for _, e := range tr.Events {
+					fmt.Fprintf(&out, "  #%d %-9s %-10s %s\n", e.Seq, e.Event, e.Actor, e.RequestID)
 				}
 			}
 			return text(out.String())

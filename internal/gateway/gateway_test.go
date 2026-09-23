@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,19 @@ var noRedirect = &http.Client{CheckRedirect: func(*http.Request, []*http.Request
 // login runs the ChatGPT-side OAuth dance and returns an access token.
 func (e *env) login(t *testing.T, code string) (string, *http.Response) {
 	t.Helper()
+	s, resp := e.loginSession(t, code)
+	return s.AccessToken, resp
+}
+
+// session is what a completed login leaves ChatGPT holding.
+type session struct {
+	gateway.Tokens
+	ClientID string
+}
+
+// loginSession runs the OAuth dance and returns the tokens and client_id.
+func (e *env) loginSession(t *testing.T, code string) (session, *http.Response) {
+	t.Helper()
 	const redirect = "https://chatgpt.com/connector_platform_oauth_redirect"
 	reg, _ := http.Post(e.gw.URL+"/register", "application/json", strings.NewReader(`{"redirect_uris":["`+redirect+`"],"client_name":"ChatGPT"}`))
 	var client struct {
@@ -73,7 +87,7 @@ func (e *env) login(t *testing.T, code string) (string, *http.Response) {
 		t.Fatal(err)
 	}
 	if resp.StatusCode != http.StatusFound {
-		return "", resp
+		return session{}, resp
 	}
 	loc, _ := url.Parse(resp.Header.Get("Location"))
 	if loc.Query().Get("state") != "xyz" {
@@ -87,7 +101,7 @@ func (e *env) login(t *testing.T, code string) (string, *http.Response) {
 	if tokens.AccessToken == "" {
 		t.Fatalf("no access token (status %d)", tok.StatusCode)
 	}
-	return tokens.AccessToken, resp
+	return session{Tokens: tokens, ClientID: client.ClientID}, resp
 }
 
 type bearer struct{ tok string }
@@ -215,5 +229,169 @@ func TestConnectEndpointIsAdminOnly(t *testing.T) {
 	}
 	if err := e.m.Client(t, "muse").Raw(context.Background(), "POST", "/v1/admin/connect", map[string]string{"name": "chatgpt"}, nil); err == nil {
 		t.Fatal("muse should not be able to connect agents")
+	}
+}
+
+func (e *env) refresh(t *testing.T, refreshToken, clientID string) (gateway.Tokens, int) {
+	t.Helper()
+	resp, err := http.PostForm(e.gw.URL+"/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}, "client_id": {clientID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var tokens gateway.Tokens
+	json.NewDecoder(resp.Body).Decode(&tokens)
+	return tokens, resp.StatusCode
+}
+
+// ChatGPT's access tokens expire hourly, so long-lived connections live on
+// refresh: it must issue a working token, rotate single-use, and bind to the
+// client that got it.
+func TestRefreshRotatesTokens(t *testing.T) {
+	e := setup(t)
+	code, _, _ := e.conn.Connect(context.Background(), "chatgpt")
+	s, _ := e.loginSession(t, code)
+	if s.RefreshToken == "" || s.ClientID == "" {
+		t.Fatalf("login left no refresh token or client_id: %+v", s)
+	}
+
+	fresh, status := e.refresh(t, s.RefreshToken, s.ClientID)
+	if status != http.StatusOK || fresh.AccessToken == "" || fresh.RefreshToken == "" {
+		t.Fatalf("refresh: status %d, %+v", status, fresh)
+	}
+	if fresh.AccessToken == s.AccessToken || fresh.RefreshToken == s.RefreshToken {
+		t.Fatal("refresh returned the old tokens")
+	}
+	cs := e.mcpSession(t, fresh.AccessToken)
+	res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{Name: "list_agents", Arguments: map[string]any{}})
+	if err != nil || res.IsError {
+		t.Fatalf("list_agents with refreshed token: %v %+v", err, res)
+	}
+
+	if tok, status := e.refresh(t, s.RefreshToken, s.ClientID); status != http.StatusBadRequest || tok.AccessToken != "" {
+		t.Fatalf("reused refresh token: status %d, %+v", status, tok)
+	}
+
+	if tok, status := e.refresh(t, fresh.RefreshToken, "tincan-someone-else"); status != http.StatusBadRequest || tok.AccessToken != "" {
+		t.Fatalf("refresh with mismatched client_id: status %d, %+v", status, tok)
+	}
+}
+
+func register(t *testing.T, e *env, body string) (*http.Response, map[string]any) {
+	t.Helper()
+	resp, err := http.Post(e.gw.URL+"/register", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	json.NewDecoder(resp.Body).Decode(&out)
+	return resp, out
+}
+
+func TestRegisterRejectsTooManyRedirects(t *testing.T) {
+	e := setup(t)
+	uris := make([]string, 6)
+	for i := range uris {
+		uris[i] = `"https://chatgpt.com/cb` + string(rune('a'+i)) + `"`
+	}
+	resp, out := register(t, e, `{"redirect_uris":[`+strings.Join(uris, ",")+`]}`)
+	if resp.StatusCode != http.StatusBadRequest || out["error"] == nil {
+		t.Fatalf("6 redirect URIs: status %d, %v", resp.StatusCode, out)
+	}
+}
+
+func TestRegisterRejectsOversizeRedirect(t *testing.T) {
+	e := setup(t)
+	long := "https://chatgpt.com/" + strings.Repeat("a", 2048)
+	resp, out := register(t, e, `{"redirect_uris":["`+long+`"]}`)
+	if resp.StatusCode != http.StatusBadRequest || out["error"] != "invalid_redirect_uri" {
+		t.Fatalf("oversize redirect URI: status %d, %v", resp.StatusCode, out)
+	}
+}
+
+func TestRegisterRejectsOversizeBody(t *testing.T) {
+	e := setup(t)
+	resp, out := register(t, e, `{"redirect_uris":["https://chatgpt.com/cb"],"client_name":"`+strings.Repeat("x", 20<<10)+`"}`)
+	if resp.StatusCode != http.StatusBadRequest || out["error"] != "invalid_client_metadata" {
+		t.Fatalf("20 KB body: status %d, %v", resp.StatusCode, out)
+	}
+}
+
+func countRows(t *testing.T, e *env, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := e.m.Store.DB().QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// Registration is public, so abandoned clients are pruned and the table is
+// capped; expired codes and tokens are swept at the same moment.
+func TestRegisterPrunesStaleClients(t *testing.T) {
+	e := setup(t)
+	db := e.m.Store.DB()
+	now := time.Now()
+	old := now.Add(-25 * time.Hour).UnixMilli()
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO gw_clients(client_id, redirect_uris, created_at) VALUES (?, ?, ?)`, []any{"stale", "https://x/cb", old}},
+		{`INSERT INTO gw_clients(client_id, redirect_uris, created_at) VALUES (?, ?, ?)`, []any{"kept", "https://x/cb", old}},
+		{`INSERT INTO gw_clients(client_id, redirect_uris, created_at) VALUES (?, ?, ?)`, []any{"recent", "https://x/cb", now.UnixMilli()}},
+		{`INSERT INTO gw_tokens(hash, kind, agent, client_id, expires_at) VALUES (?, ?, ?, ?, ?)`, []any{"live", "refresh", "chatgpt", "kept", now.Add(time.Hour).UnixMilli()}},
+		{`INSERT INTO gw_tokens(hash, kind, agent, client_id, expires_at) VALUES (?, ?, ?, ?, ?)`, []any{"dead", "access", "chatgpt", "recent", now.Add(-time.Minute).UnixMilli()}},
+		{`INSERT INTO gw_codes(hash, kind, agent, expires_at) VALUES (?, ?, ?, ?)`, []any{"deadcode", "login", "chatgpt", now.Add(-time.Minute).UnixMilli()}},
+		{`INSERT INTO gw_codes(hash, kind, agent, expires_at) VALUES (?, ?, ?, ?)`, []any{"livecode", "login", "chatgpt", now.Add(time.Minute).UnixMilli()}},
+	} {
+		if _, err := db.Exec(q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if resp, out := register(t, e, `{"redirect_uris":["https://chatgpt.com/cb"]}`); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register: %d %v", resp.StatusCode, out)
+	}
+	for id, want := range map[string]int{"stale": 0, "kept": 1, "recent": 1} {
+		if got := countRows(t, e, `SELECT count(*) FROM gw_clients WHERE client_id = ?`, id); got != want {
+			t.Errorf("client %s: %d rows, want %d", id, got, want)
+		}
+	}
+	if got := countRows(t, e, `SELECT count(*) FROM gw_tokens WHERE hash = 'dead'`); got != 0 {
+		t.Error("expired token not swept")
+	}
+	if got := countRows(t, e, `SELECT count(*) FROM gw_tokens WHERE hash = 'live'`); got != 1 {
+		t.Error("live token swept")
+	}
+	if got := countRows(t, e, `SELECT count(*) FROM gw_codes WHERE hash = 'deadcode'`); got != 0 {
+		t.Error("expired code not swept")
+	}
+	if got := countRows(t, e, `SELECT count(*) FROM gw_codes WHERE hash = 'livecode'`); got != 1 {
+		t.Error("live code swept")
+	}
+}
+
+func TestRegisterCapsClientCount(t *testing.T) {
+	e := setup(t)
+	tx, err := e.m.Store.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	for i := range 1000 {
+		if _, err := tx.Exec(`INSERT INTO gw_clients(client_id, redirect_uris, created_at) VALUES (?, ?, ?)`, "c"+strconv.Itoa(i), "https://x/cb", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	resp, out := register(t, e, `{"redirect_uris":["https://chatgpt.com/cb"]}`)
+	if resp.StatusCode != http.StatusTooManyRequests || out["error"] == nil {
+		t.Fatalf("register at the cap: status %d, %v", resp.StatusCode, out)
+	}
+	if got := countRows(t, e, `SELECT count(*) FROM gw_clients`); got != 1000 {
+		t.Fatalf("clients = %d, want 1000", got)
 	}
 }

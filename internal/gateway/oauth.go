@@ -55,6 +55,17 @@ const (
 
 var errInvalid = errors.New("invalid or expired")
 
+// Registration is public and unauthenticated, so the client table is bounded:
+// clients older than staleClientAge that never got a token are pruned, and
+// registration is refused while maxClients remain.
+const (
+	maxClients     = 1000
+	staleClientAge = 24 * time.Hour
+)
+
+// ErrTooManyClients means registration is full until stale clients age out.
+var ErrTooManyClients = errors.New("too many registered clients")
+
 // Row kinds in gw_codes and gw_tokens.
 const (
 	kindLogin   = "login"
@@ -107,11 +118,43 @@ func (o *OAuth) MintLoginCode(ctx context.Context, agent string) (string, error)
 	return code, err
 }
 
-// RegisterClient implements dynamic client registration.
+// RegisterClient implements dynamic client registration. It first sweeps
+// expired codes and tokens and prunes stale token-less clients, then refuses
+// with ErrTooManyClients if the table is still at the cap.
 func (o *OAuth) RegisterClient(ctx context.Context, redirectURIs string) (string, error) {
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := o.now()
+	for _, q := range []struct {
+		sql string
+		arg int64
+	}{
+		{`DELETE FROM gw_codes WHERE expires_at <= ?`, now.UnixMilli()},
+		{`DELETE FROM gw_tokens WHERE expires_at <= ?`, now.UnixMilli()},
+		{`DELETE FROM gw_clients WHERE created_at < ? AND client_id NOT IN (SELECT client_id FROM gw_tokens)`, now.Add(-staleClientAge).UnixMilli()},
+	} {
+		if _, err := tx.ExecContext(ctx, q.sql, q.arg); err != nil {
+			return "", err
+		}
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM gw_clients`).Scan(&n); err != nil {
+		return "", err
+	}
+	if n >= maxClients {
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return "", ErrTooManyClients
+	}
 	id := "tincan-" + secret()[:16]
-	_, err := o.db.ExecContext(ctx, `INSERT INTO gw_clients(client_id, redirect_uris, created_at) VALUES (?, ?, ?)`, id, redirectURIs, o.now().UnixMilli())
-	return id, err
+	if _, err := tx.ExecContext(ctx, `INSERT INTO gw_clients(client_id, redirect_uris, created_at) VALUES (?, ?, ?)`, id, redirectURIs, now.UnixMilli()); err != nil {
+		return "", err
+	}
+	return id, tx.Commit()
 }
 
 // ClientRedirects returns a registered client's redirect URIs (newline separated).

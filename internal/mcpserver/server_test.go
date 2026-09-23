@@ -2,6 +2,7 @@ package mcpserver_test
 
 import (
 	"context"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -96,12 +97,43 @@ func TestAskInboxReplyOverMCP(t *testing.T) {
 	if got := call(t, inst, "get_reply", map[string]any{"request_id": id}); !strings.Contains(got, "done, Tue 3pm") {
 		t.Fatalf("get_reply = %q", got)
 	}
-	if got := call(t, muse, "trace", map[string]any{"trace_id": id}); !strings.Contains(got, "hop 1: instinct -> muse [answered]") {
+	got := call(t, muse, "trace", map[string]any{"trace_id": id})
+	if !strings.Contains(got, "hop 1: instinct -> muse [answered]") {
 		t.Fatalf("trace = %q", got)
+	}
+	// The audit trail the CLI shows is there too.
+	if !strings.Contains(got, "Events:\n") || !regexp.MustCompile(`#\d+ claimed\s+muse\s+`+id).MatchString(got) {
+		t.Fatalf("trace missing audit events: %q", got)
 	}
 	// A second check finds nothing: the request was claimed.
 	if got := call(t, muse, "check_inbox", nil); !strings.Contains(got, "No requests waiting") {
 		t.Fatalf("second inbox = %q", got)
+	}
+}
+
+// An agent handling two requests names the one its ask continues; the relay
+// cannot guess with two open claims.
+func TestAskWithParentIDContinuesChain(t *testing.T) {
+	m := testrelay.New(t, relay.Config{MaxWait: 3 * time.Second})
+	inst, grok, muse := session(t, m, "instinct"), session(t, m, "grokbot"), session(t, m, "muse")
+	call(t, inst, "ask", map[string]any{"to": "muse", "message": "call the dentist", "wait_seconds": 1})
+	call(t, grok, "ask", map[string]any{"to": "muse", "message": "something else", "wait_seconds": 1})
+	inbox := call(t, muse, "check_inbox", nil)
+	var id string
+	for _, block := range strings.Split(inbox, "Request ")[1:] {
+		if strings.Contains(block, "call the dentist") {
+			id, _, _ = strings.Cut(block, " from")
+		}
+	}
+	if id == "" {
+		t.Fatalf("inbox = %q", inbox)
+	}
+	out := call(t, muse, "ask", map[string]any{"to": "grokbot", "message": "confirm Tue 3pm", "wait_seconds": 1, "parent_id": id})
+	if strings.HasPrefix(out, "ERROR:") {
+		t.Fatalf("ask with parent_id = %q", out)
+	}
+	if got := call(t, muse, "trace", map[string]any{"trace_id": id}); !strings.Contains(got, "hop 2: muse -> grokbot") {
+		t.Fatalf("trace = %q", got)
 	}
 }
 

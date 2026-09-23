@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -481,11 +482,27 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.dir.Remove(r.Context(), s.remote(r), in.Name); err != nil {
-		writeErr(w, statusFor(err), err)
+	// Revoke tokens and cancel open requests before unbinding, so a failure
+	// leaves the agent bound (and the removal retryable) rather than removed
+	// with live tokens or still-deliverable requests.
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
 		return
 	}
-	ids, err := s.store.CancelAllTo(r.Context(), in.Name)
+	if ok, err := s.dir.Has(r.Context(), in.Name); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	} else if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("%s: %w", in.Name, identity.ErrUnknownAgent))
+		return
+	}
+	if s.conn != nil {
+		if err := s.conn.Revoke(r.Context(), in.Name); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("revoke %s: %w", in.Name, err))
+			return
+		}
+	}
+	ids, err := s.store.CancelAllFor(r.Context(), in.Name)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -493,10 +510,9 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	for _, id := range ids {
 		s.hub.notify(requestKey(id))
 	}
-	if s.conn != nil {
-		if err := s.conn.Revoke(r.Context(), in.Name); err != nil {
-			log.Printf("revoke %s: %v", in.Name, err)
-		}
+	if err := s.dir.Remove(r.Context(), s.remote(r), in.Name); err != nil {
+		writeErr(w, statusFor(err), err)
+		return
 	}
 	s.record(r.Context(), "removed", "", "", in.Name, store.DetailJSON(map[string]any{"cancelled": len(ids)}))
 	writeJSON(w, http.StatusOK, map[string]any{"removed": in.Name, "cancelled": len(ids)})

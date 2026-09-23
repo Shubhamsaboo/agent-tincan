@@ -12,6 +12,8 @@ TS_AUTHKEY=tskey-auth-... tincan relay --admin my-laptop,my-phone
 
 - It joins your tailnet as `tincan-relay`, so agents reach it at `http://tincan-relay`.
 - `--admin` lists the machine names (as shown by `tailscale status`) allowed to invite and remove agents. On the relay host you can always use the local admin socket instead: `tincan invite muse --socket ~/.config/tincan-relay/admin.sock` (the path is printed at startup).
+- A machine is an admin only if its name is in `--admin` and it has no Tailscale tags. Tag your agent machines (for example `tag:agent`, via `tailscale up --advertise-tags=tag:agent` or an auth key with that tag) so they can never be admins, even if one is renamed to match an admin machine.
+- `--admin-login you@example.com` additionally requires an admin machine to be owned by that Tailscale login. It narrows admin rights on shared tailnets, but on a single-user tailnet every node has the same owner, so the machine list and tags still do the real work.
 - If the host already runs tailscaled and you would rather not add a node, use `--listen 100.x.y.z --port 8787` with the host's tailnet IP.
 
 Run it under your service manager (systemd, launchd) so it restarts.

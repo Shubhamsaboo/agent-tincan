@@ -4,7 +4,7 @@
 
 - The relay only listens on your tailnet. The one exception is the optional ChatGPT gateway, which serves only the MCP tools and OAuth on its own Funnel hostname.
 - Every request is attributed to the agent that sent it, using Tailscale's identity for the machine it came from. An agent cannot send as another agent, and whatever it writes in the `from` field is ignored.
-- Only admin devices (the `--admin` list) and the relay's local admin socket can invite, remove, or connect agents.
+- Only admin devices and the relay's local admin socket can invite, remove, or connect agents, or trace every chain. A caller is an admin device only when all of these hold: Tailscale WhoIs reports its short machine name in the `--admin` list; the node has no Tailscale tags; and, if `--admin-login` is set, the node's owning login is in that list. Machine names are chosen by whoever controls the node, so tag every agent machine (for example `tag:agent`): a tagged node is never an admin, whatever it is called. Owner login alone is not used, because on a single-user tailnet every node, agents included, has the same owner.
 - Chains are tracked by the relay, not by the model. A request made while handling another continues that chain even if the model leaves the parent out. A request that would loop back to an agent already in its chain is rejected, and chains longer than 4 hops are rejected.
 - Each sender is rate-limited (30 new requests per minute by default).
 - Every send, delivery, claim, reply, rejection, wake, join, and removal is written to an append-only, hash-chained log. `tincan audit-verify` detects edits.

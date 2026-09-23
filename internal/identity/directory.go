@@ -65,6 +65,10 @@ type Store interface {
 type Config struct {
 	// Admins lists the machine names allowed to invite and remove agents.
 	Admins []string
+	// AdminLogins, when set, also requires an admin node's owning Tailscale
+	// login to be listed. Every node on a single-user tailnet shares one login,
+	// so this narrows admin rights but cannot replace the machine list.
+	AdminLogins []string
 	// Now overrides the clock in tests.
 	Now func() time.Time
 }
@@ -136,6 +140,10 @@ func (d *Directory) Join(ctx context.Context, remoteAddr, code string) (string, 
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	bound, taken, err := d.store.AgentByNode(ctx, n.ID)
+	if err != nil {
+		return "", err
+	}
 	inv, ok, err := d.store.TakeInvite(ctx, strings.ToUpper(strings.TrimSpace(code)))
 	if err != nil {
 		return "", err
@@ -143,10 +151,13 @@ func (d *Directory) Join(ctx context.Context, remoteAddr, code string) (string, 
 	if !ok || d.cfg.Now().After(inv.Expires) {
 		return "", ErrBadInvite
 	}
-	if a, ok, err := d.store.AgentByNode(ctx, n.ID); err != nil {
-		return "", err
-	} else if ok && a.Name != inv.Name {
-		return "", fmt.Errorf("%s is %q: %w", n.Name, a.Name, ErrNodeTaken)
+	if taken && bound.Name != inv.Name {
+		// A mistaken join from an already-joined machine must not burn the
+		// code. Join holds d.mu, so no other join can observe the gap.
+		if err := d.store.PutInvite(ctx, inv); err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("%s is %q: %w", n.Name, bound.Name, ErrNodeTaken)
 	}
 	a := Agent{Name: inv.Name, NodeID: n.ID, NodeName: n.Name, JoinedAt: d.cfg.Now()}
 	if err := d.store.PutAgent(ctx, a); err != nil {
@@ -188,10 +199,18 @@ func (d *Directory) requireAdmin(ctx context.Context, remoteAddr string) error {
 	if err != nil {
 		return err
 	}
-	if slices.Contains(d.cfg.Admins, n.Name) {
-		return nil
+	// Admin = named in --admin, untagged (tagged nodes are services, never
+	// people), and, when --admin-login is set, owned by a listed login.
+	if !slices.Contains(d.cfg.Admins, n.Name) {
+		return fmt.Errorf("%s: %w", n.Name, ErrNotAdmin)
 	}
-	return fmt.Errorf("%s: %w", n.Name, ErrNotAdmin)
+	if len(n.Tags) > 0 {
+		return fmt.Errorf("%s is tagged %s: %w", n.Name, strings.Join(n.Tags, ","), ErrNotAdmin)
+	}
+	if len(d.cfg.AdminLogins) > 0 && !slices.Contains(d.cfg.AdminLogins, n.User) {
+		return fmt.Errorf("%s is owned by %q: %w", n.Name, n.User, ErrNotAdmin)
+	}
+	return nil
 }
 
 // codeAlphabet drops 0, 1, I, and O so codes read cleanly aloud.

@@ -202,6 +202,49 @@ func TestRemoveCancelsQueuedRequests(t *testing.T) {
 	h.do(museAddr, "GET", "/v1/poll?hold=0", "", http.StatusForbidden, nil)
 }
 
+// Removing an agent also withdraws what it sent: the target must not act on
+// a request from an agent that no longer exists.
+func TestRemoveCancelsRequestsTheAgentSent(t *testing.T) {
+	h := newHarness(t, Config{})
+	sent := h.send(grokAddr, "muse", "x")
+	h.do(macAddr, "POST", "/v1/admin/remove", `{"name":"grokbot"}`, http.StatusOK, nil)
+	h.do(museAddr, "GET", "/v1/poll?hold=0", "", http.StatusNoContent, nil)
+	if _, st, err := h.st.Request(context.Background(), sent.ID); err != nil || st != envelope.StatusCancelled {
+		t.Fatalf("status = %s, %v, want cancelled", st, err)
+	}
+}
+
+type failingConnector struct{}
+
+func (failingConnector) Connect(context.Context, string) (string, string, error) {
+	return "", "", errors.New("unused")
+}
+func (failingConnector) Revoke(context.Context, string) error { return errors.New("token store down") }
+
+// If tokens cannot be revoked, the removal fails and nothing changes: the
+// agent stays bound and its requests stay open.
+func TestRemoveFailsWhenRevokeFails(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.srv.SetConnector(failingConnector{})
+	sent := h.send(grokAddr, "muse", "x")
+	rec := h.do(macAddr, "POST", "/v1/admin/remove", `{"name":"muse"}`, http.StatusInternalServerError, nil)
+	if !strings.Contains(rec.Body.String(), "token store down") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	var out struct{ Agents []client.AgentInfo }
+	h.do(grokAddr, "GET", "/v1/agents", "", http.StatusOK, &out)
+	found := false
+	for _, a := range out.Agents {
+		found = found || a.Name == "muse"
+	}
+	if !found {
+		t.Fatalf("muse was removed despite the revoke failure: %+v", out.Agents)
+	}
+	if _, st, _ := h.st.Request(context.Background(), sent.ID); st != envelope.StatusQueued {
+		t.Fatalf("request status = %s, want queued", st)
+	}
+}
+
 func TestAgentsListShowsPresence(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.do(museAddr, "GET", "/v1/poll?hold=0", "", http.StatusNoContent, nil)

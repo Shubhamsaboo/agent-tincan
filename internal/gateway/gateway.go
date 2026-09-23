@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"log"
 	"net/http"
@@ -122,7 +123,15 @@ func (g *Gateway) authServer(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// Limits on the public, unauthenticated registration endpoint.
+const (
+	registerMaxBody     = 16 << 10
+	registerMaxRedirect = 5
+	redirectMaxLen      = 2048
+)
+
 func (g *Gateway) register(w http.ResponseWriter, r *http.Request) {
+	client.LimitBody(w, r, registerMaxBody)
 	var in struct {
 		RedirectURIs []string `json:"redirect_uris"`
 		ClientName   string   `json:"client_name"`
@@ -131,13 +140,25 @@ func (g *Gateway) register(w http.ResponseWriter, r *http.Request) {
 		oauthErr(w, "invalid_client_metadata", "redirect_uris required")
 		return
 	}
+	if len(in.RedirectURIs) > registerMaxRedirect {
+		oauthErr(w, "invalid_client_metadata", "at most 5 redirect_uris")
+		return
+	}
 	for _, u := range in.RedirectURIs {
+		if len(u) > redirectMaxLen {
+			oauthErr(w, "invalid_redirect_uri", "redirect URI too long")
+			return
+		}
 		if !validRedirect(u) {
 			oauthErr(w, "invalid_redirect_uri", "redirect URIs must be https (or http on localhost)")
 			return
 		}
 	}
 	id, err := g.oauth.RegisterClient(r.Context(), strings.Join(in.RedirectURIs, "\n"))
+	if errors.Is(err, ErrTooManyClients) {
+		oauthErrStatus(w, http.StatusTooManyRequests, "temporarily_unavailable", "too many registered clients; try again later")
+		return
+	}
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
@@ -282,7 +303,11 @@ func (g *Gateway) token(w http.ResponseWriter, r *http.Request) {
 }
 
 func oauthErr(w http.ResponseWriter, code, desc string) {
-	writeJSON(w, http.StatusBadRequest, map[string]string{"error": code, "error_description": desc})
+	oauthErrStatus(w, http.StatusBadRequest, code, desc)
+}
+
+func oauthErrStatus(w http.ResponseWriter, status int, code, desc string) {
+	writeJSON(w, status, map[string]string{"error": code, "error_description": desc})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

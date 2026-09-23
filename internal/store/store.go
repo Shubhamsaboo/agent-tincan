@@ -261,7 +261,9 @@ func (s *Store) CountQueued(ctx context.Context, agent string) (int, error) {
 	return n, err
 }
 
-// Claim marks a request as being worked on by its target, under a lease.
+// Claim marks a request as being worked on by its target, under a lease. A
+// notify gets no lease: no reply will ever close it, so a lease would requeue
+// and redeliver it every ClaimLease. A claimed notify simply stays claimed.
 func (s *Store) Claim(ctx context.Context, id, agent string, lease time.Duration) (envelope.Request, error) {
 	req, _, err := s.lookup(ctx, id)
 	if err != nil {
@@ -271,9 +273,9 @@ func (s *Store) Claim(ctx context.Context, id, agent string, lease time.Duration
 		return envelope.Request{}, ErrForbidden
 	}
 	now := s.now()
-	res, err := s.db.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = ?, updated_at = ?
+	res, err := s.db.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = CASE WHEN kind = ? THEN 0 ELSE ? END, updated_at = ?
 		WHERE id = ? AND status IN (?, ?, ?) AND expires_at > ?`,
-		string(envelope.StatusClaimed), now.Add(lease).UnixMilli(), now.UnixMilli(), id,
+		string(envelope.StatusClaimed), string(envelope.KindNotify), now.Add(lease).UnixMilli(), now.UnixMilli(), id,
 		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed), now.UnixMilli())
 	if err != nil {
 		return envelope.Request{}, err
@@ -374,11 +376,13 @@ func (s *Store) Cancel(ctx context.Context, id, agent string) error {
 	return nil
 }
 
-// CancelAllTo cancels every open request addressed to agent (used when an
-// agent is removed). It returns the cancelled ids.
-func (s *Store) CancelAllTo(ctx context.Context, agent string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `UPDATE requests SET status = ?, updated_at = ? WHERE to_agent = ? AND status IN (?, ?, ?) RETURNING id`,
-		string(envelope.StatusCancelled), s.now().UnixMilli(), agent,
+// CancelAllFor cancels every open request sent by or addressed to agent (used
+// when an agent is removed, so nothing it sent is still delivered). It returns
+// the cancelled ids.
+func (s *Store) CancelAllFor(ctx context.Context, agent string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `UPDATE requests SET status = ?, lease_until = 0, updated_at = ?
+		WHERE (from_agent = ? OR to_agent = ?) AND status IN (?, ?, ?) RETURNING id`,
+		string(envelope.StatusCancelled), s.now().UnixMilli(), agent, agent,
 		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed))
 	if err != nil {
 		return nil, err
@@ -439,17 +443,23 @@ func (s *Store) Sweep(ctx context.Context) ([]Transition, error) {
 	return out, nil
 }
 
-// OpenClaim returns the most recent request agent has claimed and not yet
-// answered, if any. The relay uses it to continue a chain when a sender
-// forgets to name a parent.
+// OpenClaim returns the ask agent has claimed and not yet answered, when it
+// has exactly one. The relay uses it to continue a chain when a sender forgets
+// to name a parent. With several open claims it cannot tell which one a new
+// request continues, so it reports none and the request starts a new chain.
+// Claimed notifies never count: nothing closes them.
 func (s *Store) OpenClaim(ctx context.Context, agent string) (envelope.Request, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+requestCols+` FROM requests WHERE to_agent = ? AND status = ?
-		ORDER BY updated_at DESC LIMIT 1`, agent, string(envelope.StatusClaimed))
-	req, _, err := scanRequest(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return envelope.Request{}, false, nil
+	rows, err := s.db.QueryContext(ctx, `SELECT `+requestCols+` FROM requests WHERE to_agent = ? AND status = ? AND kind = ?
+		ORDER BY updated_at DESC LIMIT 2`, agent, string(envelope.StatusClaimed), string(envelope.KindAsk))
+	if err != nil {
+		return envelope.Request{}, false, err
 	}
-	return req, err == nil, err
+	defer rows.Close()
+	reqs, err := scanRequests(rows)
+	if err != nil || len(reqs) != 1 {
+		return envelope.Request{}, false, err
+	}
+	return reqs[0], true, nil
 }
 
 // Request returns a stored request regardless of caller (relay-internal).

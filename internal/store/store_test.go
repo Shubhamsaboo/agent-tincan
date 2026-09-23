@@ -228,18 +228,46 @@ func TestSurvivesRestart(t *testing.T) {
 	}
 }
 
-func TestCancelAllTo(t *testing.T) {
+func TestCancelAllFor(t *testing.T) {
 	s, _ := open(t, ":memory:")
 	ctx := context.Background()
 	ask(t, s, "grokbot", "muse", "a")
 	ask(t, s, "instinct", "muse", "b")
-	ask(t, s, "muse", "grokbot", "c")
-	ids, err := s.CancelAllTo(ctx, "muse")
-	if err != nil || len(ids) != 2 {
+	sent := ask(t, s, "muse", "grokbot", "c")
+	other := ask(t, s, "instinct", "grokbot", "d")
+	ids, err := s.CancelAllFor(ctx, "muse")
+	if err != nil || len(ids) != 3 {
 		t.Fatalf("cancelled %v, %v", ids, err)
 	}
-	if got, _ := s.Deliver(ctx, "grokbot", 10, time.Minute); len(got) != 1 {
-		t.Fatalf("request to grokbot should survive: %+v", got)
+	if _, st, _ := s.Request(ctx, sent.ID); st != envelope.StatusCancelled {
+		t.Fatalf("request sent by muse: status %s, want cancelled", st)
+	}
+	if got, _ := s.Deliver(ctx, "grokbot", 10, time.Minute); len(got) != 1 || got[0].ID != other.ID {
+		t.Fatalf("only the request from instinct should reach grokbot: %+v", got)
+	}
+}
+
+// A claimed notify has no reply coming, so its claim lease must not requeue
+// it every ClaimLease forever.
+func TestClaimedNotifyNotRequeued(t *testing.T) {
+	s, c := open(t, ":memory:")
+	ctx := context.Background()
+	req, err := s.Enqueue(ctx, envelope.Request{From: "grokbot", To: "muse", Kind: envelope.KindNotify, Body: "fyi", Hop: 1, Chain: []string{}}, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Deliver(ctx, "muse", 10, time.Minute); len(got) != 1 {
+		t.Fatalf("deliver = %+v", got)
+	}
+	if _, err := s.Claim(ctx, req.ID, "muse", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(31 * time.Minute)
+	if _, err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Deliver(ctx, "muse", 10, time.Minute); len(got) != 0 {
+		t.Fatalf("claimed notify redelivered: %+v", got)
 	}
 }
 
@@ -254,5 +282,27 @@ func TestOpenClaim(t *testing.T) {
 	got, ok, err := s.OpenClaim(ctx, "muse")
 	if err != nil || !ok || got.ID != req.ID {
 		t.Fatalf("open claim = %+v %v %v", got, ok, err)
+	}
+}
+
+// With more than one open claim the relay cannot tell which one a new ask
+// continues, and a claimed notify is never a parent.
+func TestOpenClaimOnlyWhenUnambiguous(t *testing.T) {
+	s, _ := open(t, ":memory:")
+	ctx := context.Background()
+	n, _ := s.Enqueue(ctx, envelope.Request{From: "grokbot", To: "muse", Kind: envelope.KindNotify, Body: "fyi", Hop: 1, Chain: []string{}}, time.Hour)
+	s.Claim(ctx, n.ID, "muse", time.Minute)
+	if got, ok, _ := s.OpenClaim(ctx, "muse"); ok {
+		t.Fatalf("claimed notify became a parent: %+v", got)
+	}
+	a := ask(t, s, "instinct", "muse", "a")
+	s.Claim(ctx, a.ID, "muse", time.Minute)
+	if got, ok, err := s.OpenClaim(ctx, "muse"); err != nil || !ok || got.ID != a.ID {
+		t.Fatalf("single ask claim = %+v %v %v", got, ok, err)
+	}
+	b := ask(t, s, "grokbot", "muse", "b")
+	s.Claim(ctx, b.ID, "muse", time.Minute)
+	if got, ok, err := s.OpenClaim(ctx, "muse"); err != nil || ok {
+		t.Fatalf("two open claims: want none, got %+v %v %v", got, ok, err)
 	}
 }
