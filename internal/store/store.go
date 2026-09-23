@@ -229,6 +229,15 @@ func (s *Store) Deliver(ctx context.Context, agent string, limit int, lease time
 	return out, nil
 }
 
+// CountQueued returns how many requests are waiting for agent without
+// delivering them.
+func (s *Store) CountQueued(ctx context.Context, agent string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM requests WHERE to_agent = ? AND status = ? AND expires_at > ?`,
+		agent, string(envelope.StatusQueued), s.now().UnixMilli()).Scan(&n)
+	return n, err
+}
+
 // Claim marks a request as being worked on by its target, under a lease.
 func (s *Store) Claim(ctx context.Context, id, agent string, lease time.Duration) (envelope.Request, error) {
 	req, _, err := s.lookup(ctx, id)

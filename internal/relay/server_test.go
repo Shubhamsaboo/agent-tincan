@@ -336,3 +336,47 @@ func (c chainPrep) Prepare(ctx context.Context, req *envelope.Request) error {
 	req.TraceID, req.Hop, req.Chain = p.TraceID, p.Hop+1, append(append([]string{}, p.Chain...), req.From)
 	return nil
 }
+
+// A listener peeks: it learns requests are waiting without taking them, so
+// the agent's own inbox check still receives them.
+func TestPeekDoesNotDeliver(t *testing.T) {
+	h := newHarness(t, Config{PollHold: 5 * time.Second})
+	var peek struct{ Waiting int }
+	var wg sync.WaitGroup
+	wg.Go(func() { h.do(museAddr, "GET", "/v1/poll?peek=1", "", http.StatusOK, &peek) })
+	time.Sleep(100 * time.Millisecond)
+	if !h.srv.Online("muse") {
+		t.Error("an agent holding a poll should count as online")
+	}
+	sent := h.send(grokAddr, "muse", "call Joe's Garage")
+	wg.Wait()
+	if peek.Waiting != 1 {
+		t.Fatalf("peek = %+v", peek)
+	}
+	var got pollResult
+	h.do(museAddr, "GET", "/v1/poll?hold=0", "", http.StatusOK, &got)
+	if len(got.Requests) != 1 || got.Requests[0].ID != sent.ID {
+		t.Fatalf("request was taken by the peek: %+v", got)
+	}
+}
+
+type fixedWake map[string]string
+
+func (f fixedWake) WakeMethod(a string) string { return f[a] }
+
+func TestAgentsListShowsOnlyWakeMethodName(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.srv.SetWakeNamer(fixedWake{"grokbot": "webhook", "instinct": "email", "muse": "wait"})
+	rec := h.do(museAddr, "GET", "/v1/agents", "", http.StatusOK, nil)
+	body := rec.Body.String()
+	for _, want := range []string{`"wake":"webhook"`, `"wake":"email"`, `"wake":"wait"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("agents list missing %s: %s", want, body)
+		}
+	}
+	for _, leak := range []string{"http://", "https://", "@", "bearer"} {
+		if strings.Contains(strings.ToLower(body), leak) {
+			t.Errorf("agents list leaks %q: %s", leak, body)
+		}
+	}
+}

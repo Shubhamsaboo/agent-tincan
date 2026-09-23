@@ -79,12 +79,13 @@ type Server struct {
 
 	mu       sync.Mutex
 	lastPoll map[string]time.Time
+	polling  map[string]int // long-polls currently held open, per agent
 }
 
 // New builds a relay server.
 func New(dir *identity.Directory, st *store.Store, cfg Config) *Server {
 	cfg.defaults()
-	return &Server{cfg: cfg, dir: dir, store: st, hub: newHub(), prep: newChain{}, lastPoll: map[string]time.Time{}}
+	return &Server{cfg: cfg, dir: dir, store: st, hub: newHub(), prep: newChain{}, lastPoll: map[string]time.Time{}, polling: map[string]int{}}
 }
 
 // SetPreparer installs the chain and policy step.
@@ -240,11 +241,45 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hold := durationParam(r, "hold", s.cfg.PollHold, s.cfg.PollHold)
+	peek := r.URL.Query().Get("peek") == "1"
+	s.mu.Lock()
+	s.polling[name]++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.polling[name]--
+		s.mu.Unlock()
+	}()
 	deadline := time.NewTimer(hold)
 	defer deadline.Stop()
 	for {
 		s.touch(name)
 		wake := s.hub.wait(inboxKey(name))
+		if peek {
+			// Report how many are waiting without delivering them, so a
+			// listener can nudge the agent and the agent's own check_inbox
+			// still receives them.
+			n, err := s.store.CountQueued(r.Context(), name)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err)
+				return
+			}
+			if n > 0 {
+				writeJSON(w, http.StatusOK, map[string]any{"waiting": n})
+				return
+			}
+		}
+		if peek {
+			select {
+			case <-wake:
+				continue
+			case <-deadline.C:
+				w.WriteHeader(http.StatusNoContent)
+				return
+			case <-r.Context().Done():
+				return
+			}
+		}
 		reqs, err := s.store.Deliver(r.Context(), name, 20, s.cfg.DeliveryLease)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
@@ -475,6 +510,18 @@ func (s *Server) record(ctx context.Context, event, requestID, traceID, actor, d
 	if err := s.store.Audit(ctx, store.AuditEvent{Event: event, RequestID: requestID, TraceID: traceID, Actor: actor, Detail: detail}); err != nil {
 		log.Printf("audit %s %s: %v", event, requestID, err)
 	}
+}
+
+// Online reports whether agent has polled recently enough that its poller
+// will pick up a new request without a wake.
+func (s *Server) Online(agent string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.polling[agent] > 0 {
+		return true
+	}
+	last := s.lastPoll[agent]
+	return !last.IsZero() && s.cfg.Now().Sub(last) < 5*time.Second
 }
 
 func (s *Server) touch(agent string) {

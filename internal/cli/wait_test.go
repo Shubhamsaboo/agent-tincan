@@ -4,11 +4,17 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
+	"github.com/mvanhorn/agent-tincan/internal/envelope"
+	"github.com/mvanhorn/agent-tincan/internal/relay"
+	"github.com/mvanhorn/agent-tincan/internal/testrelay"
 )
 
 // A flaky tailnet path (Instinct saw this) must not end a background wait.
@@ -43,5 +49,28 @@ func TestWaitStopsWhenNotJoined(t *testing.T) {
 	r, _ := client.NewRelay(ts.URL, "")
 	if _, err := waitForRequests(context.Background(), r, 0); !client.IsStatus(err, http.StatusForbidden) {
 		t.Fatalf("want 403, got %v", err)
+	}
+}
+
+func TestListenRunsCommandWithoutTakingRequests(t *testing.T) {
+	m := testrelay.New(t, relay.Config{PollHold: 2 * time.Second})
+	muse := m.Client(t, "muse")
+	out := filepath.Join(t.TempDir(), "nudged")
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		m.Client(t, "grokbot").Send(context.Background(), "muse", "call Joe's Garage", envelope.KindAsk, "")
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := listen(ctx, muse, `echo "$TINCAN_WAITING" > `+out, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(out)
+	if strings.TrimSpace(string(got)) != "1" {
+		t.Fatalf("command saw TINCAN_WAITING=%q", got)
+	}
+	reqs, err := muse.Poll(context.Background(), 0)
+	if err != nil || len(reqs) != 1 {
+		t.Fatalf("request should still be waiting for muse: %+v %v", reqs, err)
 	}
 }

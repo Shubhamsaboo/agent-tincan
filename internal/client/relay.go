@@ -130,6 +130,16 @@ func (r *Relay) Poll(ctx context.Context, hold time.Duration) ([]envelope.Reques
 	return out.Requests, err
 }
 
+// Peek waits up to hold for requests without taking them, and returns how
+// many are waiting. Listeners use it so the agent's own check still gets them.
+func (r *Relay) Peek(ctx context.Context, hold time.Duration) (int, error) {
+	var out struct {
+		Waiting int `json:"waiting"`
+	}
+	err := r.call(ctx, r.polls, "GET", fmt.Sprintf("/v1/poll?peek=1&hold=%d", int(hold.Seconds())), nil, &out)
+	return out.Waiting, err
+}
+
 // Claim marks a request as being handled by this agent.
 func (r *Relay) Claim(ctx context.Context, id string) (envelope.Request, error) {
 	var out envelope.Request

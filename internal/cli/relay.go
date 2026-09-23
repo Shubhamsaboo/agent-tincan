@@ -21,6 +21,7 @@ import (
 	"github.com/mvanhorn/agent-tincan/internal/policy"
 	"github.com/mvanhorn/agent-tincan/internal/relay"
 	"github.com/mvanhorn/agent-tincan/internal/store"
+	"github.com/mvanhorn/agent-tincan/internal/wake"
 )
 
 type relayFlags struct {
@@ -41,7 +42,10 @@ func relayCmd() *cobra.Command {
 this host's tailnet IP and uses the host's tailscaled instead.
 
 Admin commands (invite, remove) are accepted from the machines named in
---admin and from the local admin socket in the state dir.`,
+--admin and from the local admin socket in the state dir.
+
+Wake settings (webhook URLs, email addresses, keys) live in wake.json in the
+state dir, chmod 600. They are never sent to agents.`,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runRelay(cmd.Context(), f) },
 	}
 	cmd.Flags().StringVar(&f.listen, "listen", "", "bind this host tailnet IP (100.x.y.z) instead of starting tsnet")
@@ -108,6 +112,13 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	dir := identity.NewDirectory(st, who, identity.Config{Admins: f.admins})
 	srv := relay.New(dir, st, relay.Config{})
 	srv.SetPreparer(policy.New(st, policy.Config{}))
+	wakeCfg, err := wake.LoadConfig(filepath.Join(f.stateDir, "wake.json"))
+	if err != nil {
+		return err
+	}
+	waker := wake.New(wakeCfg, st, wake.Options{Online: srv.Online})
+	srv.SetEvents(waker)
+	srv.SetWakeNamer(waker)
 	go srv.Run(ctx)
 
 	api := client.Configure(&http.Server{Handler: srv.Handler()}, client.RelayAPI)
