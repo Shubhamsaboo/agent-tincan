@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -173,20 +174,105 @@ func TestReinviteMovesAgentToNewMachine(t *testing.T) {
 	}
 }
 
-func TestOneMachineOneAgent(t *testing.T) {
+// Several agents can share one machine (claude-code and codex on a laptop).
+// Each joins with its own invite and the client names itself per request.
+func TestSecondAgentJoinsSameMachine(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	if got, err := f.dir.Join(ctx, "100.0.0.4:1", f.invite(t, "claude-code")); err != nil || got != "claude-code" {
+		t.Fatalf("first join: %q, %v", got, err)
+	}
+	// One agent on the node: no claim needed, current behavior preserved.
+	if got, err := f.dir.Attribute(ctx, "100.0.0.4:1"); err != nil || got != "claude-code" {
+		t.Fatalf("single agent attribute: %q, %v", got, err)
+	}
+	if got, err := f.dir.Join(ctx, "100.0.0.4:1", f.invite(t, "codex")); err != nil || got != "codex" {
+		t.Fatalf("second join on same node: %q, %v", got, err)
+	}
+	for _, name := range []string{"claude-code", "codex"} {
+		if got, err := f.dir.Resolve(ctx, "100.0.0.4:1", name); err != nil || got != name {
+			t.Errorf("resolve claim %s: %q, %v", name, got, err)
+		}
+	}
+	_, err := f.dir.Resolve(ctx, "100.0.0.4:1", "")
+	if !errors.Is(err, identity.ErrAgentAmbiguous) {
+		t.Fatalf("two agents, no claim: want ErrAgentAmbiguous, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "claude-code") || !strings.Contains(err.Error(), "codex") {
+		t.Fatalf("ambiguity error should list both names: %v", err)
+	}
+}
+
+// A claim is only honored for a name bound to the calling node.
+func TestClaimForAnotherNodeIsNotJoined(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.dir.Join(ctx, "100.0.0.2:1", f.invite(t, "grokbot"))
 	f.dir.Join(ctx, "100.0.0.4:1", f.invite(t, "muse"))
-	code := f.invite(t, "muse2")
-	if _, err := f.dir.Join(ctx, "100.0.0.4:1", code); !errors.Is(err, identity.ErrNodeTaken) {
-		t.Fatalf("second name on same node: want ErrNodeTaken, got %v", err)
+	if _, err := f.dir.Resolve(ctx, "100.0.0.4:1", "grokbot"); !errors.Is(err, identity.ErrNotJoined) {
+		t.Fatalf("claiming another node's agent: want ErrNotJoined, got %v", err)
 	}
-	// The rejected attempt must not burn the code: the right machine can still use it.
-	if got, err := f.dir.Join(ctx, "100.0.0.3:1", code); err != nil || got != "muse2" {
-		t.Fatalf("join after rejected attempt: got %q, %v", got, err)
+	if _, err := f.dir.Resolve(ctx, "100.0.0.4:1", "nobody"); !errors.Is(err, identity.ErrNotJoined) {
+		t.Fatalf("claiming an unknown agent: want ErrNotJoined, got %v", err)
 	}
-	if _, err := f.dir.Join(ctx, "100.0.0.2:1", code); !errors.Is(err, identity.ErrBadInvite) {
-		t.Fatalf("code reused after successful join: want ErrBadInvite, got %v", err)
+	if _, err := f.dir.Resolve(ctx, "100.0.0.1:1", "muse"); !errors.Is(err, identity.ErrNotJoined) {
+		t.Fatalf("claim from an unjoined node: want ErrNotJoined, got %v", err)
+	}
+}
+
+// Re-inviting a name still moves it, and only it: other agents on the old
+// machine stay put.
+func TestReinviteMovesOnlyThatAgent(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.dir.Join(ctx, "100.0.0.3:1", f.invite(t, "hermes"))
+	f.dir.Join(ctx, "100.0.0.3:1", f.invite(t, "openclaw"))
+	if _, err := f.dir.Join(ctx, "100.0.0.4:1", f.invite(t, "openclaw")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.dir.Attribute(ctx, "100.0.0.4:1"); err != nil || got != "openclaw" {
+		t.Fatalf("new machine: %q, %v", got, err)
+	}
+	if got, err := f.dir.Attribute(ctx, "100.0.0.3:1"); err != nil || got != "hermes" {
+		t.Fatalf("old machine should keep hermes alone: %q, %v", got, err)
+	}
+}
+
+func TestRemoveLeavesOtherAgentOnSameMachine(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.dir.Join(ctx, "100.0.0.1:1", f.invite(t, "claude-code"))
+	f.dir.Join(ctx, "100.0.0.1:1", f.invite(t, "codex"))
+	if err := f.dir.Remove(ctx, "100.0.0.1:1", "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.dir.Attribute(ctx, "100.0.0.1:1"); err != nil || got != "claude-code" {
+		t.Fatalf("after removing codex: %q, %v", got, err)
+	}
+	if _, err := f.dir.Resolve(ctx, "100.0.0.1:1", "codex"); !errors.Is(err, identity.ErrNotJoined) {
+		t.Fatalf("removed codex claim: want ErrNotJoined, got %v", err)
+	}
+}
+
+// An agent's kind survives a move to a new machine.
+func TestKindSurvivesMove(t *testing.T) {
+	store := identity.NewMemoryStore()
+	who := identitytest.New(map[string]identity.Node{"100.0.0.3:1": instinctNode, "100.0.0.4:1": museNode})
+	dir := identity.NewDirectory(store, who, identity.Config{})
+	ctx := context.Background()
+	code, _ := dir.Invite(ctx, identity.LocalAdmin, "hermes")
+	dir.Join(ctx, "100.0.0.3:1", code)
+	if ok, err := store.SetAgentKind(ctx, "hermes", "hermes"); err != nil || !ok {
+		t.Fatalf("set kind: %v, %v", ok, err)
+	}
+	if ok, _ := store.SetAgentKind(ctx, "nobody", "codex"); ok {
+		t.Fatal("setting kind on an unknown agent should report false")
+	}
+	code, _ = dir.Invite(ctx, identity.LocalAdmin, "hermes")
+	dir.Join(ctx, "100.0.0.4:1", code)
+	a, _, _ := store.AgentByName(ctx, "hermes")
+	if a.NodeID != museNode.ID || a.Kind != "hermes" {
+		t.Fatalf("after move: %+v", a)
 	}
 }
 
@@ -252,4 +338,110 @@ func TestProbeFailsWithoutTailscaled(t *testing.T) {
 	if err := r.Probe(ctx); err == nil {
 		t.Fatal("probe should fail with no reachable tailscaled")
 	}
+}
+
+// An invite's kind is applied on join and wins over a kind the name already
+// had; an invite without a kind keeps the old one.
+func TestInviteKindAppliedOnJoin(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	code, err := f.dir.InviteKind(ctx, "100.0.0.1:1", "hermes", "hermes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.dir.Join(ctx, "100.0.0.3:1", code)
+	if a := agentNamed(t, f.dir, "hermes"); a.Kind != "hermes" {
+		t.Fatalf("kind after join = %q", a.Kind)
+	}
+	f.dir.Join(ctx, "100.0.0.4:1", f.invite(t, "hermes"))
+	if a := agentNamed(t, f.dir, "hermes"); a.Kind != "hermes" || a.NodeID != museNode.ID {
+		t.Fatalf("kindless re-invite: %+v", a)
+	}
+	code, _ = f.dir.InviteKind(ctx, "100.0.0.1:1", "hermes", "openclaw")
+	f.dir.Join(ctx, "100.0.0.3:1", code)
+	if a := agentNamed(t, f.dir, "hermes"); a.Kind != "openclaw" {
+		t.Fatalf("kind after re-invite with kind = %q", a.Kind)
+	}
+	if _, err := f.dir.InviteKind(ctx, "100.0.0.1:1", "x", "Bad Kind"); err == nil {
+		t.Fatal("malformed kind should be rejected")
+	}
+}
+
+func TestSetKindIsAdminOnly(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.dir.Join(ctx, "100.0.0.2:1", f.invite(t, "grokbot"))
+	if err := f.dir.SetKind(ctx, "100.0.0.2:1", "grokbot", "vm-webhook"); !errors.Is(err, identity.ErrNotAdmin) {
+		t.Fatalf("non-admin set kind: %v", err)
+	}
+	if err := f.dir.SetKind(ctx, "100.0.0.1:1", "grokbot", "vm-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	if a := agentNamed(t, f.dir, "grokbot"); a.Kind != "vm-webhook" {
+		t.Fatalf("kind = %q", a.Kind)
+	}
+	if err := f.dir.SetKind(ctx, identity.LocalAdmin, "nobody", "codex"); !errors.Is(err, identity.ErrUnknownAgent) {
+		t.Fatalf("unknown agent: %v", err)
+	}
+}
+
+// pausingStore runs pause after the first AgentByName read, which Join does
+// between taking the invite and writing the agent.
+type pausingStore struct {
+	*identity.MemoryStore
+	pause func()
+}
+
+func (p *pausingStore) AgentByName(ctx context.Context, name string) (identity.Agent, bool, error) {
+	a, ok, err := p.MemoryStore.AgentByName(ctx, name)
+	if p.pause != nil {
+		pause := p.pause
+		p.pause = nil
+		pause()
+	}
+	return a, ok, err
+}
+
+// SetKind waits for a Join in progress, so the kind it sets is not
+// overwritten by the kind Join read before it.
+func TestSetKindDuringJoinIsNotLost(t *testing.T) {
+	ctx := context.Background()
+	st := &pausingStore{MemoryStore: identity.NewMemoryStore()}
+	who := identitytest.New(map[string]identity.Node{"100.0.0.1:1": macNode, "100.0.0.2:1": grokNode})
+	dir := identity.NewDirectory(st, who, identity.Config{Admins: []string{"macbook-pro-44"}})
+	st.PutAgent(ctx, identity.Agent{Name: "grokbot", NodeID: "nOLD", NodeName: "old", Kind: "codex"})
+	code, err := dir.Invite(ctx, identity.LocalAdmin, "grokbot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	st.pause = func() {
+		go func() { done <- dir.SetKind(ctx, identity.LocalAdmin, "grokbot", "vm-webhook") }()
+		select {
+		case err := <-done:
+			done <- err // SetKind finished inside Join: the race this guards
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if _, err := dir.Join(ctx, "100.0.0.2:1", code); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if a := agentNamed(t, dir, "grokbot"); a.Kind != "vm-webhook" || a.NodeID != "nGROK" {
+		t.Fatalf("after join and set kind = %+v", a)
+	}
+}
+
+func agentNamed(t *testing.T, d *identity.Directory, name string) identity.Agent {
+	t.Helper()
+	a, ok, err := d.Agent(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatalf("no agent %s", name)
+	}
+	return a
 }

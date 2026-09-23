@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,5 +101,125 @@ func TestProxyOverrideRoutesRelayTraffic(t *testing.T) {
 	}
 	if _, err := client.NewRelay("", ""); err == nil {
 		t.Fatal("empty relay URL should fail")
+	}
+}
+
+// A client built from config names its agent on every relay call, so a
+// machine running several agents is attributed per process.
+func TestConfiguredAgentSentOnEveryRequest(t *testing.T) {
+	seen := map[string]string{}
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.Method+" "+r.URL.Path] = r.Header.Get(client.AgentHeader)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	r, err := client.NewRelayFor(client.Config{Relay: ts.URL, Agent: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	r.Agents(ctx)
+	r.Poll(ctx, 0)
+	r.Peek(ctx, 0)
+	r.Send(ctx, "grokbot", "hi", envelope.KindAsk, "")
+	r.Get(ctx, "r1", 0)
+	r.Claim(ctx, "r1")
+	r.Reply(ctx, "r1", "ok", envelope.StatusAnswered)
+	r.Cancel(ctx, "r1")
+	r.Raw(ctx, "GET", "/v1/trace", nil, nil)
+	if len(seen) != 8 { // poll and peek share a path
+		t.Fatalf("calls seen = %v", seen)
+	}
+	for call, agent := range seen {
+		if agent != "codex" {
+			t.Errorf("%s sent agent header %q, want codex", call, agent)
+		}
+	}
+	// No configured agent (before join, or an admin device): no header.
+	bare, _ := client.NewRelayFor(client.Config{Relay: ts.URL})
+	bare.Agents(ctx)
+	if got := seen["GET /v1/agents"]; got != "" {
+		t.Fatalf("unnamed client sent header %q", got)
+	}
+}
+
+// claude-code and codex on one machine, through the real relay.
+func TestTwoAgentsOnOneMachineThroughClient(t *testing.T) {
+	m := testrelay.New(t, relay.Config{})
+	codex := m.JoinOnMachineOf(t, "muse", "codex")
+	muse := m.Client(t, "muse")
+	ctx := context.Background()
+	for name, c := range map[string]*client.Relay{"codex": codex, "muse": muse} {
+		req, err := c.Send(ctx, "grokbot", "hi from "+name, envelope.KindAsk, "")
+		if err != nil || req.From != name {
+			t.Fatalf("%s send: from %q, %v", name, req.From, err)
+		}
+	}
+	sent, err := m.Client(t, "grokbot").Send(ctx, "codex", "for codex", envelope.KindAsk, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reqs, err := muse.Poll(ctx, 0); err != nil || len(reqs) != 0 {
+		t.Fatalf("muse must not get codex's request: %+v %v", reqs, err)
+	}
+	if reqs, err := codex.Poll(ctx, 0); err != nil || len(reqs) != 1 || reqs[0].ID != sent.ID {
+		t.Fatalf("codex poll: %+v %v", reqs, err)
+	}
+}
+
+// An invite can carry a kind that shows in the roster after join; an admin
+// can change it; a joined non-admin cannot.
+func TestInviteKindAndSetKindThroughClient(t *testing.T) {
+	m := testrelay.New(t, relay.Config{})
+	ctx := context.Background()
+	admin := m.Client(t, "admin")
+	code, err := admin.InviteKind(ctx, "cx", "hermes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Client(t, "stranger").Join(ctx, code); err != nil {
+		t.Fatal(err)
+	}
+	kindOf := func(name string) string {
+		t.Helper()
+		agents, err := admin.Agents(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range agents {
+			if a.Name == name {
+				return a.Kind
+			}
+		}
+		t.Fatalf("no %s in %+v", name, agents)
+		return ""
+	}
+	if k := kindOf("cx"); k != "hermes" {
+		t.Fatalf("kind after join = %q", k)
+	}
+	if err := admin.SetKind(ctx, "cx", "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if k := kindOf("cx"); k != "codex" {
+		t.Fatalf("kind after set = %q", k)
+	}
+	if err := m.Client(t, "grokbot").SetKind(ctx, "cx", "openclaw"); !client.IsStatus(err, http.StatusForbidden) {
+		t.Fatalf("non-admin set kind: %v", err)
+	}
+	if k := kindOf("cx"); k != "codex" {
+		t.Fatalf("non-admin changed kind to %q", k)
+	}
+}
+
+func TestBaseIsTheRelayURL(t *testing.T) {
+	r, err := client.NewRelay("http://tincan-relay/", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Base() != "http://tincan-relay" {
+		t.Fatalf("base = %q", r.Base())
 	}
 }

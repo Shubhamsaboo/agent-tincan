@@ -13,12 +13,14 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 	"github.com/mvanhorn/agent-tincan/internal/identity"
+	"github.com/mvanhorn/agent-tincan/internal/onboard"
 	"github.com/mvanhorn/agent-tincan/internal/store"
 )
 
@@ -129,6 +131,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/requests/{id}", s.handleGet)
 	mux.HandleFunc("POST /v1/requests/{id}/cancel", s.handleCancel)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
+	mux.HandleFunc("GET /v1/whoami", s.handleWhoAmI)
 	mux.HandleFunc("POST /v1/join", s.handleJoin)
 	s.adminRoutes(mux)
 	return limitBodies(mux)
@@ -139,6 +142,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) adminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
 	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
+	mux.HandleFunc("PUT /v1/agents/{name}/kind", s.handleSetKind)
 	mux.HandleFunc("POST /v1/admin/connect", s.handleConnect)
 	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
 	mux.HandleFunc("GET /v1/trace", s.handleRecent)
@@ -210,14 +214,42 @@ func (s *Server) remote(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// agent attributes the request or writes an error and returns "".
+// agent attributes the request or writes an error and returns "". WhoIs
+// picks the node; the client's X-Tincan-Agent header picks among that node's
+// agents and is refused for a name bound elsewhere. A rebuilt machine that the
+// directory re-admits on the way is audited as a "rebind".
 func (s *Server) agent(w http.ResponseWriter, r *http.Request) string {
-	name, err := s.dir.Attribute(r.Context(), r.RemoteAddr)
+	res, err := s.dir.ResolveAgent(r.Context(), r.RemoteAddr, r.Header.Get(client.AgentHeader))
 	if err != nil {
-		writeErr(w, http.StatusForbidden, err)
+		code := http.StatusForbidden
+		if errors.Is(err, identity.ErrRebindCheckFailed) {
+			code = http.StatusServiceUnavailable
+		}
+		writeErr(w, code, err)
 		return ""
 	}
-	return name
+	if rb := res.Rebind; rb != nil {
+		log.Printf("rebind: %s moved from %s (%s) to %s (%s)", rb.Agent, rb.OldNodeName, rb.OldNode, rb.NewNodeName, rb.NewNode)
+		s.record(r.Context(), "rebind", "", "", rb.Agent, store.DetailJSON(map[string]any{
+			"agent": rb.Agent, "old_node": rb.OldNode, "old_node_name": rb.OldNodeName, "new_node": rb.NewNode, "new_node_name": rb.NewNodeName,
+		}))
+	}
+	return res.Name
+}
+
+// handleWhoAmI tells the calling agent who the relay thinks it is. tincan
+// rejoin calls it to confirm a rebuilt machine was re-admitted.
+func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
+	name := s.agent(w, r)
+	if name == "" {
+		return
+	}
+	a, _, err := s.dir.Agent(r.Context(), name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"name": name, "kind": a.Kind})
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -417,8 +449,10 @@ type WakeNamer interface{ WakeMethod(agent string) string }
 // SetWakeNamer installs the wake method lookup for the agent list.
 func (s *Server) SetWakeNamer(w WakeNamer) { s.wake = w }
 
+// handleAgents lists the roster for joined agents and for admin devices,
+// which need not be joined (onboarding runs from an admin laptop).
 func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
-	if !isLocalAdmin(r.Context()) && s.agent(w, r) == "" {
+	if !s.isAdmin(r) && s.agent(w, r) == "" {
 		return
 	}
 	agents, err := s.dir.Agents(r.Context())
@@ -431,7 +465,7 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	for _, a := range agents {
 		last := s.lastPoll[a.Name]
-		info := client.AgentInfo{Name: a.Name, LastPoll: last, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none"}
+		info := client.AgentInfo{Name: a.Name, LastPoll: last, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none", Kind: a.Kind}
 		if s.wake != nil {
 			info.Wake = s.wake.WakeMethod(a.Name)
 		}
@@ -461,17 +495,58 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Name string `json:"name"`
+		Kind string `json:"kind"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	code, err := s.dir.Invite(r.Context(), s.remote(r), in.Name)
+	if err := knownKind(in.Kind); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	code, err := s.dir.InviteKind(r.Context(), s.remote(r), in.Name, in.Kind)
 	if err != nil {
 		writeErr(w, statusFor(err), err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": in.Name, "code": code, "expires_in": identity.InviteTTL.String()})
+	writeJSON(w, http.StatusOK, map[string]any{"name": in.Name, "kind": in.Kind, "code": code, "expires_in": identity.InviteTTL.String()})
+}
+
+// handleSetKind records a joined agent's runtime kind (admin only). An empty
+// kind clears it.
+func (s *Server) handleSetKind(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	if err := knownKind(in.Kind); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	name := r.PathValue("name")
+	if err := s.dir.SetKind(r.Context(), s.remote(r), name, in.Kind); err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	s.record(r.Context(), "kind", "", "", name, store.DetailJSON(map[string]any{"kind": in.Kind}))
+	writeJSON(w, http.StatusOK, map[string]string{"name": name, "kind": in.Kind})
+}
+
+// knownKind accepts "" and the kinds onboarding can tailor a block to, so a
+// typo is caught when it is set rather than silently ignored later.
+func knownKind(kind string) error {
+	if onboard.KnownKind(kind) {
+		return nil
+	}
+	return fmt.Errorf("unknown kind %q (want one of %s)", kind, strings.Join(onboard.Kinds, ", "))
 }
 
 func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
@@ -584,11 +659,14 @@ func statusFor(err error) int {
 	switch {
 	case errors.As(err, &se):
 		return se.Code
+	case errors.Is(err, identity.ErrRebindCheckFailed):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, identity.ErrUnknownAgent):
 		return http.StatusNotFound
-	case errors.Is(err, store.ErrForbidden), errors.Is(err, identity.ErrNotAdmin), errors.Is(err, identity.ErrNotJoined):
+	case errors.Is(err, store.ErrForbidden), errors.Is(err, identity.ErrNotAdmin), errors.Is(err, identity.ErrNotJoined),
+		errors.Is(err, identity.ErrAgentAmbiguous):
 		return http.StatusForbidden
-	case errors.Is(err, store.ErrWrongState), errors.Is(err, identity.ErrNodeTaken):
+	case errors.Is(err, store.ErrWrongState):
 		return http.StatusConflict
 	case errors.Is(err, identity.ErrBadInvite):
 		return http.StatusBadRequest

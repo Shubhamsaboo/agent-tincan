@@ -1,6 +1,9 @@
 // Package identity decides which agent sent a request. An agent is a name Matt
 // chose, bound to one tailnet node by a one-time invite code. There are no
 // keys: Tailscale authenticates the node, and the directory maps node to name.
+// A node may carry several agents (claude-code and codex on one laptop); the
+// client then names itself and the directory accepts the name only if it is
+// bound to the calling node.
 package identity
 
 import (
@@ -27,10 +30,24 @@ var (
 	ErrNotAdmin     = errors.New("admin commands must come from an admin device")
 	ErrBadInvite    = errors.New("invite code is invalid, used, or expired")
 	ErrUnknownAgent = errors.New("no such agent")
-	ErrNodeTaken    = errors.New("this machine is already joined as another agent")
+	// ErrAgentAmbiguous means several agents share the calling machine and the
+	// request did not say which one it comes from.
+	ErrAgentAmbiguous = errors.New("several agents share this machine; the client must name one (point TINCAN_CONFIG at that agent's config)")
+	// ErrRebindCheckFailed means re-admitting a rebuilt machine could not
+	// check whether the agent's old node is still online. It is a transient
+	// failure, not a refusal.
+	ErrRebindCheckFailed = errors.New("could not check the agent's old node; try again")
 )
 
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
+
+// Kinds share the name shape: lowercase words such as hermes or vm-webhook.
+func checkKind(kind string) error {
+	if kind != "" && !nameRE.MatchString(kind) {
+		return fmt.Errorf("agent kind %q must be 1-32 lowercase letters, digits, or dashes", kind)
+	}
+	return nil
+}
 
 // Agent is a joined agent.
 type Agent struct {
@@ -38,12 +55,18 @@ type Agent struct {
 	NodeID   string    `json:"node_id"`
 	NodeName string    `json:"node_name"`
 	JoinedAt time.Time `json:"joined_at"`
+	// Kind is the agent runtime (hermes, codex, ...), empty when unknown.
+	Kind string `json:"kind,omitempty"`
+	// NodeUser is the Tailscale login that owned the node at join, empty for
+	// agents joined before it was recorded.
+	NodeUser string `json:"node_user,omitempty"`
 }
 
 // Invite is a pending one-time code.
 type Invite struct {
 	Code    string
 	Name    string
+	Kind    string // applied to the agent on join when set
 	Expires time.Time
 }
 
@@ -53,9 +76,13 @@ type Store interface {
 	PutAgent(ctx context.Context, a Agent) error
 	DeleteAgent(ctx context.Context, name string) (bool, error)
 	Agents(ctx context.Context) ([]Agent, error)
-	// AgentByNode and AgentByName are point lookups for the hot request path.
-	AgentByNode(ctx context.Context, nodeID string) (Agent, bool, error)
+	// AgentsByNode and AgentByName are lookups for the hot request path.
+	// AgentsByNode returns every agent bound to the node, ordered by name.
+	AgentsByNode(ctx context.Context, nodeID string) ([]Agent, error)
 	AgentByName(ctx context.Context, name string) (Agent, bool, error)
+	// SetAgentKind records an agent's runtime kind ("" clears it) and reports
+	// whether the agent exists.
+	SetAgentKind(ctx context.Context, name, kind string) (bool, error)
 	PutInvite(ctx context.Context, inv Invite) error
 	// TakeInvite removes and returns the invite, so a code works once.
 	TakeInvite(ctx context.Context, code string) (Invite, bool, error)
@@ -69,6 +96,8 @@ type Config struct {
 	// login to be listed. Every node on a single-user tailnet shares one login,
 	// so this narrows admin rights but cannot replace the machine list.
 	AdminLogins []string
+	// NoAutoRebind turns off re-admitting rebuilt machines (see ResolveAgent).
+	NoAutoRebind bool
 	// Now overrides the clock in tests.
 	Now func() time.Time
 }
@@ -78,7 +107,7 @@ type Directory struct {
 	store Store
 	who   Resolver
 	cfg   Config
-	mu    sync.Mutex // serializes join so one node cannot bind two names
+	mu    sync.Mutex // serializes join so a name moves atomically
 }
 
 // NewDirectory builds a Directory.
@@ -89,20 +118,105 @@ func NewDirectory(store Store, who Resolver, cfg Config) *Directory {
 	return &Directory{store: store, who: who, cfg: cfg}
 }
 
-// Attribute returns the agent name for the node behind remoteAddr.
+// Attribute returns the agent name for the node behind remoteAddr when the
+// caller does not name itself. It fails with ErrAgentAmbiguous when the node
+// carries several agents.
 func (d *Directory) Attribute(ctx context.Context, remoteAddr string) (string, error) {
+	return d.Resolve(ctx, remoteAddr, "")
+}
+
+// Resolve returns the agent behind remoteAddr. WhoIs authenticates the node;
+// claimed, when set, picks one of the node's agents and is accepted only if
+// that name is bound to the node. With no claim, a node with one agent
+// resolves to it and a node with several fails with the choices. A rebuilt
+// machine is re-admitted on the way (see ResolveAgent).
+func (d *Directory) Resolve(ctx context.Context, remoteAddr, claimed string) (string, error) {
+	res, err := d.ResolveAgent(ctx, remoteAddr, claimed)
+	return res.Name, err
+}
+
+// ResolveAgent is Resolve that also reports a rebind. When the caller's node
+// carries no agent, or not the claimed one, it tries to re-admit the node as
+// a rebuilt machine before refusing.
+func (d *Directory) ResolveAgent(ctx context.Context, remoteAddr, claimed string) (Resolved, error) {
 	n, err := d.who.WhoIs(ctx, remoteAddr)
 	if err != nil {
-		return "", err
+		return Resolved{}, err
 	}
-	a, ok, err := d.store.AgentByNode(ctx, n.ID)
+	agents, err := d.store.AgentsByNode(ctx, n.ID)
 	if err != nil {
-		return "", err
+		return Resolved{}, err
 	}
-	if !ok {
-		return "", fmt.Errorf("%s: %w", n.Name, ErrNotJoined)
+	if claimed != "" {
+		for _, a := range agents {
+			if a.Name == claimed {
+				return d.resolved(ctx, n, a)
+			}
+		}
+		if res, ok, err := d.readmit(ctx, n, claimed); ok || err != nil {
+			return res, err
+		}
+		return Resolved{}, fmt.Errorf("%s is not %q: %w", n.Name, claimed, ErrNotJoined)
 	}
-	return a.Name, nil
+	switch len(agents) {
+	case 0:
+		if res, ok, err := d.readmit(ctx, n, ""); ok || err != nil {
+			return res, err
+		}
+		return Resolved{}, fmt.Errorf("%s: %w", n.Name, ErrNotJoined)
+	case 1:
+		// Another agent from the same rebuilt machine may still be waiting to
+		// be re-admitted, and this nameless call may be its first.
+		waiting, err := d.awaitingReadmit(ctx, n)
+		if err != nil {
+			return Resolved{}, err
+		}
+		if len(waiting) > 0 {
+			return Resolved{}, fmt.Errorf("%s runs %s, and %s from its old machine has not rejoined; each agent must name itself (tincan rejoin --name <agent>): %w",
+				n.Name, agents[0].Name, strings.Join(agentNames(waiting), ", "), ErrAgentAmbiguous)
+		}
+		return d.resolved(ctx, n, agents[0])
+	}
+	return Resolved{}, fmt.Errorf("%s runs %s: %w", n.Name, strings.Join(agentNames(agents), ", "), ErrAgentAmbiguous)
+}
+
+// resolved returns a, which is bound to n. An agent joined before logins
+// were recorded gets n's login now, so that a later rebuild of its machine
+// can be re-admitted with the login check (see readmit).
+func (d *Directory) resolved(ctx context.Context, n Node, a Agent) (Resolved, error) {
+	if a.NodeUser == "" && n.User != "" && len(n.Tags) == 0 {
+		if err := d.recordLogin(ctx, n, a.Name); err != nil {
+			return Resolved{}, err
+		}
+	}
+	return Resolved{Name: a.Name}, nil
+}
+
+// recordLogin stores n's login on agent name, provided it is still bound to
+// n with no login recorded.
+func (d *Directory) recordLogin(ctx context.Context, n Node, name string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	a, found, err := d.store.AgentByName(ctx, name)
+	if err != nil || !found || a.NodeID != n.ID || a.NodeUser != "" {
+		return err
+	}
+	a.NodeUser = n.User
+	return d.store.PutAgent(ctx, a)
+}
+
+// agentNames returns the names of agents, in order.
+func agentNames(agents []Agent) []string {
+	names := make([]string, len(agents))
+	for i, a := range agents {
+		names[i] = a.Name
+	}
+	return names
+}
+
+// Agent returns a joined agent by name.
+func (d *Directory) Agent(ctx context.Context, name string) (Agent, bool, error) {
+	return d.store.AgentByName(ctx, name)
 }
 
 // Has reports whether name is a joined agent.
@@ -114,25 +228,36 @@ func (d *Directory) Has(ctx context.Context, name string) (bool, error) {
 // Invite creates a one-time code that joins the next machine to use it as
 // name. Only admin devices may invite.
 func (d *Directory) Invite(ctx context.Context, remoteAddr, name string) (string, error) {
+	return d.InviteKind(ctx, remoteAddr, name, "")
+}
+
+// InviteKind is Invite that also records the agent's kind, applied when the
+// code is used. An empty kind leaves the agent's kind as it was.
+func (d *Directory) InviteKind(ctx context.Context, remoteAddr, name, kind string) (string, error) {
 	if err := d.requireAdmin(ctx, remoteAddr); err != nil {
 		return "", err
 	}
 	if !nameRE.MatchString(name) {
 		return "", fmt.Errorf("agent name %q must be 1-32 lowercase letters, digits, or dashes", name)
 	}
+	if err := checkKind(kind); err != nil {
+		return "", err
+	}
 	code, err := NewCode()
 	if err != nil {
 		return "", err
 	}
-	inv := Invite{Code: code, Name: name, Expires: d.cfg.Now().Add(InviteTTL)}
+	inv := Invite{Code: code, Name: name, Kind: kind, Expires: d.cfg.Now().Add(InviteTTL)}
 	if err := d.store.PutInvite(ctx, inv); err != nil {
 		return "", err
 	}
 	return code, nil
 }
 
-// Join binds the node behind remoteAddr to the invite's name. Re-inviting an
-// existing name moves it to the new machine.
+// Join binds the node behind remoteAddr to the invite's name. A node that
+// already carries agents gains another name alongside them. Re-inviting an
+// existing name moves it (and its kind, unless the invite names a new one) to
+// the new machine; other agents on the old machine stay.
 func (d *Directory) Join(ctx context.Context, remoteAddr, code string) (string, error) {
 	n, err := d.who.WhoIs(ctx, remoteAddr)
 	if err != nil {
@@ -140,10 +265,6 @@ func (d *Directory) Join(ctx context.Context, remoteAddr, code string) (string, 
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	bound, taken, err := d.store.AgentByNode(ctx, n.ID)
-	if err != nil {
-		return "", err
-	}
 	inv, ok, err := d.store.TakeInvite(ctx, strings.ToUpper(strings.TrimSpace(code)))
 	if err != nil {
 		return "", err
@@ -151,15 +272,15 @@ func (d *Directory) Join(ctx context.Context, remoteAddr, code string) (string, 
 	if !ok || d.cfg.Now().After(inv.Expires) {
 		return "", ErrBadInvite
 	}
-	if taken && bound.Name != inv.Name {
-		// A mistaken join from an already-joined machine must not burn the
-		// code. Join holds d.mu, so no other join can observe the gap.
-		if err := d.store.PutInvite(ctx, inv); err != nil {
-			return "", err
-		}
-		return "", fmt.Errorf("%s is %q: %w", n.Name, bound.Name, ErrNodeTaken)
+	prev, _, err := d.Agent(ctx, inv.Name)
+	if err != nil {
+		return "", err
 	}
-	a := Agent{Name: inv.Name, NodeID: n.ID, NodeName: n.Name, JoinedAt: d.cfg.Now()}
+	kind := prev.Kind
+	if inv.Kind != "" {
+		kind = inv.Kind
+	}
+	a := Agent{Name: inv.Name, NodeID: n.ID, NodeName: n.Name, NodeUser: n.User, JoinedAt: d.cfg.Now(), Kind: kind}
 	if err := d.store.PutAgent(ctx, a); err != nil {
 		return "", err
 	}
@@ -172,6 +293,29 @@ func (d *Directory) Remove(ctx context.Context, remoteAddr, name string) error {
 		return err
 	}
 	ok, err := d.store.DeleteAgent(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%s: %w", name, ErrUnknownAgent)
+	}
+	return nil
+}
+
+// SetKind records an agent's runtime kind ("" clears it). Only admin devices
+// may set it.
+func (d *Directory) SetKind(ctx context.Context, remoteAddr, name, kind string) error {
+	if err := d.requireAdmin(ctx, remoteAddr); err != nil {
+		return err
+	}
+	if err := checkKind(kind); err != nil {
+		return err
+	}
+	// Join rewrites the whole agent row, so a kind set while it runs would
+	// be lost.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ok, err := d.store.SetAgentKind(ctx, name, kind)
 	if err != nil {
 		return err
 	}

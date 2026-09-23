@@ -21,16 +21,17 @@ func connect() (*client.Relay, client.Config, error) {
 	if cfg.Relay == "" {
 		return nil, cfg, errors.New("no relay configured: run `tincan join <code> --relay http://tincan-relay` or set TINCAN_RELAY")
 	}
-	r, err := client.NewRelay(cfg.Relay, cfg.Proxy)
+	r, err := client.NewRelayFor(cfg)
 	return r, cfg, err
 }
 
 func agentCmds() []*cobra.Command {
-	return []*cobra.Command{joinCmd(), inviteCmd(), removeCmd(), agentsCmd(), askCmd(), getCmd(), inboxCmd(), replyCmd(), cancelCmd(), waitCmd()}
+	return []*cobra.Command{joinCmd(), inviteCmd(), kindCmd(), removeCmd(), agentsCmd(), askCmd(), getCmd(), inboxCmd(), replyCmd(), cancelCmd(), waitCmd()}
 }
 
 func joinCmd() *cobra.Command {
 	var relayURL, proxy string
+	var replace bool
 	cmd := &cobra.Command{
 		Use:   "join <code>",
 		Short: "Join this machine to the mesh with an invite code",
@@ -54,6 +55,16 @@ func joinCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The invite code does not say which agent it joins, so the check
+			// comes after the relay answers. Refusing before saving keeps the
+			// agent already using this config from acting as the new one.
+			if cfg.Agent != "" && cfg.Agent != name && !replace {
+				return fmt.Errorf("%s already belongs to agent %q, so joining as %q here would make %q act as %q. "+
+					"For a second agent on this machine, set TINCAN_CONFIG to a new file and save it there without a new invite: "+
+					"TINCAN_CONFIG=<new file> tincan rejoin --relay %s --name %s. "+
+					"To repoint this config to %q instead, run tincan join again with --replace",
+					client.ConfigPath(), cfg.Agent, name, cfg.Agent, name, cfg.Relay, name, name)
+			}
 			cfg.Agent = name
 			if err := client.SaveConfig(cfg); err != nil {
 				return err
@@ -64,11 +75,12 @@ func joinCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&relayURL, "relay", "", "relay URL, e.g. http://tincan-relay")
 	cmd.Flags().StringVar(&proxy, "proxy", "", "proxy for relay traffic (for sandboxes whose default proxy cannot reach the tailnet)")
+	cmd.Flags().BoolVar(&replace, "replace", false, "repoint a config that already names a different agent (use TINCAN_CONFIG=<new file> for a second agent instead)")
 	return cmd
 }
 
 func inviteCmd() *cobra.Command {
-	var relayURL, socket string
+	var relayURL, socket, kind string
 	cmd := &cobra.Command{
 		Use:   "invite <name>",
 		Short: "Create a one-time code that joins a machine as <name> (admin devices only)",
@@ -78,16 +90,22 @@ func inviteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			code, err := r.Invite(cmd.Context(), args[0])
+			code, err := r.InviteKind(cmd.Context(), args[0], kind)
 			if err != nil {
 				return err
 			}
-			cmd.Printf("Invite code for %q (valid 10 minutes): %s\nOn that machine run:\n  tincan join %s --relay <relay URL>\n", args[0], code, code)
+			valid := "valid 10 minutes"
+			if kind != "" {
+				valid = "kind " + kind + ", " + valid
+			}
+			cmd.Printf("Invite code for %q (%s): %s\nOn that machine run:\n  tincan join %s --relay <relay URL>\n"+
+				"(for a second agent on a machine that already runs one, prefix with TINCAN_CONFIG=<new file>)\n", args[0], valid, code, code)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&relayURL, "relay", "", "relay URL (default: saved config)")
 	cmd.Flags().StringVar(&socket, "socket", "", "relay admin socket (when running on the relay host)")
+	cmd.Flags().StringVar(&kind, "kind", "", "the agent's runtime (hermes, codex, ...), recorded on join so tincan onboard tailors its block")
 	return cmd
 }
 
@@ -120,7 +138,7 @@ func relayFor(override string) (*client.Relay, client.Config, error) {
 	}
 	cfg, _ := client.LoadConfig()
 	cfg.Relay = override
-	r, err := client.NewRelay(cfg.Relay, cfg.Proxy)
+	r, err := client.NewRelayFor(cfg)
 	return r, cfg, err
 }
 
@@ -146,7 +164,11 @@ func agentsCmd() *cobra.Command {
 func formatAgents(agents []client.AgentInfo) string {
 	var b strings.Builder
 	for _, a := range agents {
-		fmt.Fprintf(&b, "%-14s %-8s wake=%s\n", a.Name, a.State(), a.Wake)
+		fmt.Fprintf(&b, "%-14s %-8s wake=%s", a.Name, a.State(), a.Wake)
+		if a.Kind != "" {
+			fmt.Fprintf(&b, " kind=%s", a.Kind)
+		}
+		b.WriteString("\n")
 	}
 	if b.Len() == 0 {
 		return "No agents have joined yet.\n"

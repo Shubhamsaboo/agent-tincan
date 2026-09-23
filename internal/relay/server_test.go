@@ -31,11 +31,18 @@ type harness struct {
 	srv *Server
 	h   http.Handler
 	st  *store.Store
+	who *identitytest.Resolver
 }
 
 // newHarness starts a relay with grokbot, instinct, and muse joined, using a
 // fake WhoIs so tests pick each caller's tailnet identity directly.
 func newHarness(t *testing.T, cfg Config) *harness {
+	t.Helper()
+	return newHarnessDir(t, cfg, identity.Config{})
+}
+
+// newHarnessDir is newHarness with directory settings (admins are set here).
+func newHarnessDir(t *testing.T, cfg Config, dcfg identity.Config) *harness {
 	t.Helper()
 	st, err := store.Open(":memory:")
 	if err != nil {
@@ -49,9 +56,10 @@ func newHarness(t *testing.T, cfg Config) *harness {
 		museAddr:     {ID: "nMUSE", Name: "muse"},
 		strangerAddr: {ID: "nLAPTOP", Name: "old-laptop"},
 	})
-	dir := identity.NewDirectory(st, who, identity.Config{Admins: []string{"macbook-pro-44"}})
+	dcfg.Admins = []string{"macbook-pro-44"}
+	dir := identity.NewDirectory(st, who, dcfg)
 	srv := New(dir, st, cfg)
-	h := &harness{t: t, srv: srv, h: srv.Handler(), st: st}
+	h := &harness{t: t, srv: srv, h: srv.Handler(), st: st, who: who}
 	for name, addr := range map[string]string{"grokbot": grokAddr, "instinct": instinctAddr, "muse": museAddr} {
 		var inv struct{ Code string }
 		h.do(macAddr, "POST", "/v1/admin/invite", `{"name":"`+name+`"}`, http.StatusOK, &inv)
@@ -156,6 +164,84 @@ func TestUnjoinedMachineRejected(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.do(strangerAddr, "POST", "/v1/send", `{"to":"grokbot","body":"hi"}`, http.StatusForbidden, nil)
 	h.do(strangerAddr, "GET", "/v1/poll?hold=0", "", http.StatusForbidden, nil)
+}
+
+// doAs is do with the X-Tincan-Agent header the client sends.
+func (h *harness) doAs(addr, agent, method, path, body string, want int, out any) *httptest.ResponseRecorder {
+	h.t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.RemoteAddr = addr
+	req.Header.Set(client.AgentHeader, agent)
+	rec := httptest.NewRecorder()
+	h.h.ServeHTTP(rec, req)
+	if rec.Code != want {
+		h.t.Fatalf("%s %s from %s as %q: status %d, want %d: %s", method, path, addr, agent, rec.Code, want, rec.Body.String())
+	}
+	if out != nil {
+		if err := json.Unmarshal(rec.Body.Bytes(), out); err != nil {
+			h.t.Fatalf("decode %s: %v: %s", path, err, rec.Body.String())
+		}
+	}
+	return rec
+}
+
+// joinAt invites name and joins it from addr.
+func (h *harness) joinAt(addr, name string) {
+	h.t.Helper()
+	var inv struct{ Code string }
+	h.do(macAddr, "POST", "/v1/admin/invite", `{"name":"`+name+`"}`, http.StatusOK, &inv)
+	h.do(addr, "POST", "/v1/join", `{"code":"`+inv.Code+`"}`, http.StatusOK, nil)
+}
+
+// Two agents on one machine: the header picks which one a request is from.
+func TestTwoAgentsOnOneMachine(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.joinAt(strangerAddr, "claude-code")
+	// One agent on the node: no header needed.
+	var req envelope.Request
+	h.do(strangerAddr, "POST", "/v1/send", `{"to":"grokbot","body":"hi"}`, http.StatusCreated, &req)
+	if req.From != "claude-code" {
+		t.Fatalf("single-agent from = %q", req.From)
+	}
+	h.joinAt(strangerAddr, "codex")
+	for _, name := range []string{"codex", "claude-code"} {
+		h.doAs(strangerAddr, name, "POST", "/v1/send", `{"to":"grokbot","body":"hi"}`, http.StatusCreated, &req)
+		if req.From != name {
+			t.Fatalf("header %s: from = %q", name, req.From)
+		}
+	}
+	// Each agent polls its own inbox.
+	h.send(grokAddr, "codex", "for codex")
+	var got pollResult
+	h.doAs(strangerAddr, "codex", "GET", "/v1/poll?hold=0", "", http.StatusOK, &got)
+	if len(got.Requests) != 1 || got.Requests[0].To != "codex" {
+		t.Fatalf("codex poll = %+v", got)
+	}
+	h.doAs(strangerAddr, "claude-code", "GET", "/v1/poll?hold=0", "", http.StatusNoContent, nil)
+	// No header with two agents: rejected, naming both.
+	rec := h.do(strangerAddr, "POST", "/v1/send", `{"to":"grokbot","body":"hi"}`, http.StatusForbidden, nil)
+	if b := rec.Body.String(); !strings.Contains(b, "claude-code") || !strings.Contains(b, "codex") {
+		t.Fatalf("ambiguity error should list both agents: %s", b)
+	}
+	// Removing codex leaves claude-code working without a header.
+	h.do(macAddr, "POST", "/v1/admin/remove", `{"name":"codex"}`, http.StatusOK, nil)
+	h.do(strangerAddr, "POST", "/v1/send", `{"to":"grokbot","body":"hi"}`, http.StatusCreated, &req)
+	if req.From != "claude-code" {
+		t.Fatalf("after removing codex from = %q", req.From)
+	}
+	h.doAs(strangerAddr, "codex", "GET", "/v1/poll?hold=0", "", http.StatusForbidden, nil)
+}
+
+// The header cannot borrow another machine's agent.
+func TestHeaderNamingAnotherMachinesAgentRejected(t *testing.T) {
+	h := newHarness(t, Config{})
+	rec := h.doAs(museAddr, "grokbot", "POST", "/v1/send", `{"to":"instinct","body":"hi"}`, http.StatusForbidden, nil)
+	if !strings.Contains(rec.Body.String(), identity.ErrNotJoined.Error()) {
+		t.Fatalf("want not joined, got %s", rec.Body.String())
+	}
+	h.doAs(museAddr, "grokbot", "GET", "/v1/poll?hold=0", "", http.StatusForbidden, nil)
+	// The matching header is fine.
+	h.doAs(museAddr, "muse", "GET", "/v1/poll?hold=0", "", http.StatusNoContent, nil)
 }
 
 // AE6: claiming to be someone else changes nothing.
@@ -421,5 +507,81 @@ func TestAgentsListShowsOnlyWakeMethodName(t *testing.T) {
 		if strings.Contains(strings.ToLower(body), leak) {
 			t.Errorf("agents list leaks %q: %s", leak, body)
 		}
+	}
+}
+
+// An admin device that never joined can read the roster (onboarding runs
+// there); an unjoined non-admin machine still cannot.
+func TestAgentsListAdmitsUnjoinedAdmin(t *testing.T) {
+	h := newHarness(t, Config{})
+	var out struct{ Agents []client.AgentInfo }
+	h.do(macAddr, "GET", "/v1/agents", "", http.StatusOK, &out)
+	if len(out.Agents) != 3 {
+		t.Fatalf("admin roster = %+v", out.Agents)
+	}
+	rec := h.do(strangerAddr, "GET", "/v1/agents", "", http.StatusForbidden, nil)
+	if !strings.Contains(rec.Body.String(), identity.ErrNotJoined.Error()) {
+		t.Fatalf("want not joined, got %s", rec.Body.String())
+	}
+}
+
+func kinds(t *testing.T, h *harness) map[string]string {
+	t.Helper()
+	var out struct{ Agents []client.AgentInfo }
+	h.do(grokAddr, "GET", "/v1/agents", "", http.StatusOK, &out)
+	m := map[string]string{}
+	for _, a := range out.Agents {
+		m[a.Name] = a.Kind
+	}
+	return m
+}
+
+// An invite can carry the agent's kind; it is applied when the agent joins
+// and shows in the roster. An admin can change it later; nobody else can.
+func TestInviteKindAppliedOnJoinAndAdminSetsKind(t *testing.T) {
+	h := newHarness(t, Config{})
+	var inv struct{ Code string }
+	h.do(macAddr, "POST", "/v1/admin/invite", `{"name":"hermes","kind":"hermes"}`, http.StatusOK, &inv)
+	h.do(strangerAddr, "POST", "/v1/join", `{"code":"`+inv.Code+`"}`, http.StatusOK, nil)
+	if k := kinds(t, h); k["hermes"] != "hermes" || k["muse"] != "" {
+		t.Fatalf("kinds after join = %v", k)
+	}
+	rec := h.do(grokAddr, "GET", "/v1/agents", "", http.StatusOK, nil)
+	if strings.Contains(rec.Body.String(), `"name":"muse","online":false,"wake":"none","kind"`) {
+		t.Fatalf("an unknown kind should be omitted: %s", rec.Body.String())
+	}
+
+	h.do(macAddr, "PUT", "/v1/agents/hermes/kind", `{"kind":"openclaw"}`, http.StatusOK, nil)
+	if k := kinds(t, h); k["hermes"] != "openclaw" {
+		t.Fatalf("kinds after admin set = %v", k)
+	}
+	// Non-admins, joined or not, are refused and nothing changes.
+	h.do(grokAddr, "PUT", "/v1/agents/hermes/kind", `{"kind":"codex"}`, http.StatusForbidden, nil)
+	h.do(strangerAddr, "PUT", "/v1/agents/hermes/kind", `{"kind":"codex"}`, http.StatusForbidden, nil)
+	if k := kinds(t, h); k["hermes"] != "openclaw" {
+		t.Fatalf("non-admin changed kind: %v", k)
+	}
+	// Unknown agents and unknown kinds are rejected; "" clears.
+	h.do(macAddr, "PUT", "/v1/agents/nobody/kind", `{"kind":"codex"}`, http.StatusNotFound, nil)
+	h.do(macAddr, "PUT", "/v1/agents/hermes/kind", `{"kind":"codx"}`, http.StatusBadRequest, nil)
+	h.do(macAddr, "POST", "/v1/admin/invite", `{"name":"cx","kind":"codx"}`, http.StatusBadRequest, nil)
+	h.do(macAddr, "PUT", "/v1/agents/hermes/kind", `{"kind":""}`, http.StatusOK, nil)
+	if k := kinds(t, h); k["hermes"] != "" {
+		t.Fatalf("kind not cleared: %v", k)
+	}
+}
+
+// The local admin socket can set a kind too.
+func TestLocalAdminSocketCanSetKind(t *testing.T) {
+	h := newHarness(t, Config{})
+	req := httptest.NewRequest("PUT", "/v1/agents/muse/kind", strings.NewReader(`{"kind":"proxy-sandbox"}`))
+	req.RemoteAddr = "@"
+	rec := httptest.NewRecorder()
+	h.srv.AdminHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local set kind: %d %s", rec.Code, rec.Body.String())
+	}
+	if k := kinds(t, h); k["muse"] != "proxy-sandbox" {
+		t.Fatalf("kinds = %v", k)
 	}
 }

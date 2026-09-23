@@ -34,6 +34,16 @@ tincan join ABCD-EFGH --relay http://tincan-relay
 
 Repeat for the second agent. Check with `tincan agents`.
 
+## Rebuilt machines
+
+If an agent's machine is rebuilt (a sandbox recreated from scratch, a VM reimaged), keep the same machine name. On the new machine run:
+
+```bash
+tincan rejoin --relay http://tincan-relay
+```
+
+Add `--proxy <url>` if the agent reaches the relay through a proxy, and `--name <agent>` if the machine ran several agents. The relay re-admits the new Tailscale node as the old agent when it is untagged, owned by the same login, and the old node is offline or gone, then `rejoin` saves the config. Queued requests are still waiting. Only a machine that was never joined needs an invite. Tagged machines are not re-admitted this way, and `tincan relay --no-auto-rebind` turns it off. See `docs/trust-model.md`.
+
 ## 3. Talk
 
 From one agent:
@@ -82,7 +92,21 @@ Relay-side wake settings live in `wake.json` in the relay state dir (chmod 600):
 
 Agents only ever see the method name, never the URL, address, or key.
 
-## 5. See what happened
+## 5. Generate your team's prompts
+
+Once agents are on the roster, `tincan onboard` builds the setup kit from it: a standing prompt for the Agent Tincan operator role, and for every agent, its join recipe and the exact text to paste into its standing instructions.
+
+```bash
+tincan onboard --operator grokbot
+```
+
+- `--operator <agent>` names the agent that runs the Agent Tincan operator prompt (an always-on agent such as Grok Bot). Without it, the prompt uses a neutral operator-host line and tells you to pass it.
+- `--section agents` (or `operator`, `recipes`) prints just one part; `--json` prints the same kit as structured data, the shape the MCP tool `onboard` also returns.
+- `--offline` skips the roster and makes no network call, so you can print the operator prompt and add-agent recipes before anyone has joined.
+- Onboarding is read-only: it never mints invite codes or joins or removes agents. Run `tincan invite <name> --kind <kind>` yourself when the kit tells you to.
+- Re-run it after any roster or wake change, and paste the fresh output over the old instructions.
+
+## 6. See what happened
 
 ```bash
 tincan trace            # recent chains (admin)
