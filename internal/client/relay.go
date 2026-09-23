@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -76,6 +77,16 @@ func NewRelay(base, proxy string) (*Relay, error) {
 		}
 	}
 	return &Relay{base: base, api: api, polls: polls}, nil
+}
+
+// NewRelaySocket talks to the relay's local admin socket (on the relay host).
+func NewRelaySocket(path string) *Relay {
+	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", path)
+	}}
+	c := &http.Client{Timeout: 30 * time.Second, Transport: tr}
+	return &Relay{base: "http://tincan-admin", api: c, polls: c}
 }
 
 // Send queues a request. parent is the request this one continues, or "".

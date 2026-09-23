@@ -73,13 +73,13 @@ func joinCmd() *cobra.Command {
 }
 
 func inviteCmd() *cobra.Command {
-	var relayURL string
+	var relayURL, socket string
 	cmd := &cobra.Command{
 		Use:   "invite <name>",
 		Short: "Create a one-time code that joins a machine as <name> (admin devices only)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, cfg, err := relayFor(relayURL)
+			r, err := adminRelay(socket, relayURL)
 			if err != nil {
 				return err
 			}
@@ -87,22 +87,23 @@ func inviteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cmd.Printf("Invite code for %q (valid 10 minutes): %s\nOn that machine run:\n  tincan join %s --relay %s\n", args[0], code, code, cfg.Relay)
+			cmd.Printf("Invite code for %q (valid 10 minutes): %s\nOn that machine run:\n  tincan join %s --relay <relay URL>\n", args[0], code, code)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&relayURL, "relay", "", "relay URL (default: saved config)")
+	cmd.Flags().StringVar(&socket, "socket", "", "relay admin socket (when running on the relay host)")
 	return cmd
 }
 
 func removeCmd() *cobra.Command {
-	var relayURL string
+	var relayURL, socket string
 	cmd := &cobra.Command{
 		Use:   "remove <name>",
 		Short: "Remove an agent from the mesh immediately (admin devices only)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, _, err := relayFor(relayURL)
+			r, err := adminRelay(socket, relayURL)
 			if err != nil {
 				return err
 			}
@@ -114,6 +115,7 @@ func removeCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&relayURL, "relay", "", "relay URL (default: saved config)")
+	cmd.Flags().StringVar(&socket, "socket", "", "relay admin socket (when running on the relay host)")
 	return cmd
 }
 

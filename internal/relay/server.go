@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -116,6 +117,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/join", s.handleJoin)
 	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
 	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
+	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
+	mux.HandleFunc("GET /v1/trace", s.handleRecent)
+	mux.HandleFunc("GET /v1/admin/audit/verify", s.handleVerify)
 	return limitBodies(mux)
 }
 
@@ -126,6 +130,9 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
 	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
+	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
+	mux.HandleFunc("GET /v1/trace", s.handleRecent)
+	mux.HandleFunc("GET /v1/admin/audit/verify", s.handleVerify)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), localAdminKey, true)))
 	})
@@ -161,6 +168,11 @@ func (s *Server) Sweep(ctx context.Context) {
 		return
 	}
 	for _, t := range trs {
+		event := "requeued"
+		if t.Status == envelope.StatusExpired {
+			event = "expired"
+		}
+		s.record(ctx, event, t.ID, "", "relay", "")
 		s.hub.notify(requestKey(t.ID))
 		if t.Status == envelope.StatusQueued {
 			s.hub.notify(inboxKey(t.To))
@@ -205,6 +217,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.prep.Prepare(r.Context(), &req); err != nil {
+		s.record(r.Context(), "rejected", "", req.TraceID, from, store.DetailJSON(map[string]any{"to": req.To, "reason": err.Error()}))
 		writeErr(w, statusFor(err), err)
 		return
 	}
@@ -214,6 +227,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.hub.notify(inboxKey(req.To))
+	s.record(r.Context(), "queued", req.ID, req.TraceID, from, store.DetailJSON(map[string]any{"to": req.To, "hop": req.Hop, "chain": req.Chain}))
 	if s.events != nil {
 		s.events.Queued(r.Context(), req)
 	}
@@ -237,6 +251,9 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(reqs) > 0 {
+			for _, q := range reqs {
+				s.record(r.Context(), "delivered", q.ID, q.TraceID, name, "")
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"requests": reqs})
 			return
 		}
@@ -263,6 +280,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.hub.notify(requestKey(req.ID))
+	s.record(r.Context(), "claimed", req.ID, req.TraceID, name, "")
 	writeJSON(w, http.StatusOK, req)
 }
 
@@ -288,6 +306,7 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.hub.notify(requestKey(id))
+	s.record(r.Context(), "replied", id, "", name, store.DetailJSON(map[string]any{"status": rep.Status}))
 	writeJSON(w, http.StatusOK, rep)
 }
 
@@ -333,6 +352,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.hub.notify(requestKey(id))
+	s.record(r.Context(), "cancelled", id, "", name, "")
 	writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": string(envelope.StatusCancelled)})
 }
 
@@ -387,6 +407,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, statusFor(err), err)
 		return
 	}
+	s.record(r.Context(), "joined", "", "", name, "")
 	writeJSON(w, http.StatusOK, map[string]string{"name": name})
 }
 
@@ -426,6 +447,7 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	for _, id := range ids {
 		s.hub.notify(requestKey(id))
 	}
+	s.record(r.Context(), "removed", "", "", in.Name, store.DetailJSON(map[string]any{"cancelled": len(ids)}))
 	writeJSON(w, http.StatusOK, map[string]any{"removed": in.Name, "cancelled": len(ids)})
 }
 
@@ -440,6 +462,19 @@ func (s *Server) isAgent(ctx context.Context, name string) bool {
 		}
 	}
 	return false
+}
+
+// record appends an audit entry. Audit failures are logged, never fatal: the
+// relay keeps delivering if the log cannot be written.
+func (s *Server) record(ctx context.Context, event, requestID, traceID, actor, detail string) {
+	if traceID == "" && requestID != "" {
+		if req, _, err := s.store.Request(ctx, requestID); err == nil {
+			traceID = req.TraceID
+		}
+	}
+	if err := s.store.Audit(ctx, store.AuditEvent{Event: event, RequestID: requestID, TraceID: traceID, Actor: actor, Detail: detail}); err != nil {
+		log.Printf("audit %s %s: %v", event, requestID, err)
+	}
 }
 
 func (s *Server) touch(agent string) {
@@ -504,4 +539,69 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
+}
+
+// isAdmin reports whether the caller is the local admin socket or an admin
+// device.
+func (s *Server) isAdmin(r *http.Request) bool {
+	return s.dir.IsAdmin(r.Context(), s.remote(r))
+}
+
+func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
+	trace := r.PathValue("trace")
+	steps, err := s.store.Trace(r.Context(), trace)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !s.isAdmin(r) {
+		name := s.agent(w, r)
+		if name == "" {
+			return
+		}
+		if !slices.Contains(store.Participants(steps), name) {
+			writeErr(w, http.StatusNotFound, errors.New("no such trace"))
+			return
+		}
+	}
+	if len(steps) == 0 {
+		writeErr(w, http.StatusNotFound, errors.New("no such trace"))
+		return
+	}
+	events, err := s.store.AuditForTrace(r.Context(), trace)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"trace_id": trace, "steps": steps, "events": events})
+}
+
+func (s *Server) handleRecent(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	limit := 20
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 200 {
+		limit = n
+	}
+	steps, err := s.store.RecentTraces(r.Context(), limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"traces": steps})
+}
+
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	n, err := s.store.VerifyAudit(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checked": n, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "checked": n})
 }

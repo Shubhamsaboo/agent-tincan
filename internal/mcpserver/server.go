@@ -6,6 +6,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -34,10 +35,11 @@ type Backend interface {
 	Reply(ctx context.Context, id, body string, status envelope.Status) (envelope.Reply, error)
 	Cancel(ctx context.Context, id string) error
 	Agents(ctx context.Context) ([]client.AgentInfo, error)
+	Raw(ctx context.Context, method, path string, in, out any) error
 }
 
 // ToolNames lists the tools the server exposes, in order.
-var ToolNames = []string{"ask", "get_reply", "check_inbox", "claim", "reply", "cancel", "list_agents"}
+var ToolNames = []string{"ask", "get_reply", "check_inbox", "claim", "reply", "cancel", "list_agents", "trace"}
 
 type askIn struct {
 	To          string `json:"to" jsonschema:"the teammate to ask, e.g. muse"`
@@ -63,6 +65,10 @@ type replyIn struct {
 	RequestID string `json:"request_id" jsonschema:"the request you are answering"`
 	Message   string `json:"message" jsonschema:"your answer or result"`
 	Status    string `json:"status,omitempty" jsonschema:"answered (default), failed, or declined"`
+}
+
+type traceIn struct {
+	TraceID string `json:"trace_id" jsonschema:"the trace id of a chain you took part in"`
 }
 
 type noIn struct{}
@@ -162,6 +168,27 @@ func New(b Backend, version string) *mcp.Server {
 			}
 			if out.Len() == 0 {
 				return text("No agents have joined yet.")
+			}
+			return text(out.String())
+		})
+	mcp.AddTool(s, &mcp.Tool{Name: "trace", Description: "Show a request chain you took part in: who asked whom, in order, with status and replies."},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in traceIn) (*mcp.CallToolResult, any, error) {
+			var tr struct {
+				Steps []struct {
+					Request envelope.Request `json:"request"`
+					Status  envelope.Status  `json:"status"`
+					Reply   *envelope.Reply  `json:"reply"`
+				} `json:"steps"`
+			}
+			if err := b.Raw(ctx, "GET", "/v1/trace/"+url.PathEscape(in.TraceID), nil, &tr); err != nil {
+				return fail(err)
+			}
+			var out strings.Builder
+			for _, st := range tr.Steps {
+				fmt.Fprintf(&out, "hop %d: %s -> %s [%s]: %s\n", st.Request.Hop, st.Request.From, st.Request.To, st.Status, st.Request.Body)
+				if st.Reply != nil {
+					fmt.Fprintf(&out, "  reply from %s: %s\n", st.Reply.From, st.Reply.Body)
+				}
 			}
 			return text(out.String())
 		})

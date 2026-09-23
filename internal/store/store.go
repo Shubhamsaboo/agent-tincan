@@ -96,7 +96,12 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	return &Store{db: db, now: time.Now}, nil
+	s := &Store{db: db, now: time.Now}
+	if err := s.ensureAudit(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("audit schema: %w", err)
+	}
+	return s, nil
 }
 
 // SetClock overrides the clock in tests.

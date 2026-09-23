@@ -96,6 +96,9 @@ func TestAskInboxReplyOverMCP(t *testing.T) {
 	if got := call(t, inst, "get_reply", map[string]any{"request_id": id}); !strings.Contains(got, "done, Tue 3pm") {
 		t.Fatalf("get_reply = %q", got)
 	}
+	if got := call(t, muse, "trace", map[string]any{"trace_id": id}); !strings.Contains(got, "hop 1: instinct -> muse [answered]") {
+		t.Fatalf("trace = %q", got)
+	}
 	// A second check finds nothing: the request was claimed.
 	if got := call(t, muse, "check_inbox", nil); !strings.Contains(got, "No requests waiting") {
 		t.Fatalf("second inbox = %q", got)

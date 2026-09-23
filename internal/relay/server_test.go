@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -249,4 +250,89 @@ func TestOversizeBodyRejected(t *testing.T) {
 	big := strings.Repeat("x", 2<<20)
 	rec := h.do(grokAddr, "POST", "/v1/send", `{"to":"muse","body":"`+big+`"}`, http.StatusRequestEntityTooLarge, nil)
 	_ = rec
+}
+
+type traceOut struct {
+	Steps  []store.TraceStep  `json:"steps"`
+	Events []store.AuditEvent `json:"events"`
+}
+
+// AE3 chain shows up in order, with its audit trail, for participants and
+// for Matt's device, but not for an agent outside the chain.
+func TestTraceVisibility(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.srv.SetPreparer(chainPrep{h.st})
+	first := h.send(instinctAddr, "muse", "call the dentist")
+	h.do(museAddr, "POST", "/v1/requests/"+first.ID+"/claim", "", http.StatusOK, nil)
+	var second envelope.Request
+	h.do(museAddr, "POST", "/v1/send", `{"to":"grokbot","body":"new time Tue 3pm","parent_id":"`+first.ID+`"}`, http.StatusCreated, &second)
+
+	var tr traceOut
+	h.do(macAddr, "GET", "/v1/trace/"+first.TraceID, "", http.StatusOK, &tr)
+	if len(tr.Steps) != 2 || tr.Steps[1].Request.From != "muse" || tr.Steps[1].Request.To != "grokbot" {
+		t.Fatalf("trace steps = %+v", tr.Steps)
+	}
+	var events []string
+	for _, e := range tr.Events {
+		events = append(events, e.Event)
+	}
+	if strings.Join(events, ",") != "queued,claimed,queued" {
+		t.Fatalf("events = %v", events)
+	}
+	h.do(grokAddr, "GET", "/v1/trace/"+first.TraceID, "", http.StatusOK, nil) // participant
+	solo := h.send(grokAddr, "instinct", "private")
+	h.do(museAddr, "GET", "/v1/trace/"+solo.TraceID, "", http.StatusNotFound, nil)
+	h.do(museAddr, "GET", "/v1/trace", "", http.StatusForbidden, nil)
+	var recent struct{ Traces []store.TraceStep }
+	h.do(macAddr, "GET", "/v1/trace?limit=5", "", http.StatusOK, &recent)
+	if len(recent.Traces) != 2 {
+		t.Fatalf("recent = %+v", recent.Traces)
+	}
+}
+
+func TestRejectionsAreAudited(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.srv.SetPreparer(rejectAll{})
+	h.do(museAddr, "POST", "/v1/send", `{"to":"grokbot","body":"x"}`, http.StatusConflict, nil)
+	var out struct {
+		OK      bool
+		Checked int
+	}
+	h.do(macAddr, "GET", "/v1/admin/audit/verify", "", http.StatusOK, &out)
+	if !out.OK {
+		t.Fatalf("verify = %+v", out)
+	}
+	rows, _ := h.st.DB().Query(`SELECT event, actor, detail FROM audit WHERE event = 'rejected'`)
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("rejection not audited")
+	}
+	var ev, actor, detail string
+	rows.Scan(&ev, &actor, &detail)
+	if actor != "muse" || !strings.Contains(detail, "loop") {
+		t.Fatalf("rejected row = %s %s %s", ev, actor, detail)
+	}
+}
+
+type rejectAll struct{}
+
+func (rejectAll) Prepare(context.Context, *envelope.Request) error {
+	return &StatusError{Code: http.StatusConflict, Err: errors.New("request would loop")}
+}
+
+// chainPrep is a minimal parent-following preparer for relay tests (the real
+// one lives in package policy, which imports relay).
+type chainPrep struct{ st *store.Store }
+
+func (c chainPrep) Prepare(ctx context.Context, req *envelope.Request) error {
+	if req.ParentID == "" {
+		req.Hop, req.Chain = 1, []string{req.From}
+		return nil
+	}
+	p, _, err := c.st.Request(ctx, req.ParentID)
+	if err != nil {
+		return err
+	}
+	req.TraceID, req.Hop, req.Chain = p.TraceID, p.Hop+1, append(append([]string{}, p.Chain...), req.From)
+	return nil
 }
