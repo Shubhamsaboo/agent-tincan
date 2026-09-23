@@ -44,7 +44,7 @@ Run 2026-09-22 with a small Python hold server on the Grok Bot VM (100.104.237.4
 | Connects | yes (local) | yes, direct over the tailnet | yes, through `hatch-egress-proxy:3130` (the Tailscale tunnel outside its container) |
 | Longest hold that survived | n/a | 120 s (every step 10 to 120 s answered) | 30 s confirmed; the 60 s hold was still open when the server was stopped, so its outcome is unknown |
 | `WhoIs` node | grok-bot, nSxH3XiLDr11CNTRL | instinct, ntiLg1kJwr11CNTRL | muse, neDzL7Y5AX11CNTRL |
-| Wake without a human | relay calls its webhook (planned) | email to its inbox, or a scheduled wake it sets itself (no API); background-command wake pending confirmation | background shell command completion is delivered into a new turn, and background processes survive across turns |
+| Wake without a human | relay calls its webhook (planned) | email to its inbox, or a scheduled wake it sets itself (no API). Background commands do not start a turn and die when a turn ends. | background shell command completion is delivered into a new turn, and background processes survive across turns |
 
 Conclusions for the build:
 
@@ -52,7 +52,8 @@ Conclusions for the build:
 - Keep the 25 s long-poll hold. It is under the 30 s Muse hold that was confirmed.
 - Muse's normal egress proxy (`hatch-egress-proxy:3128`) rejects tailnet addresses immediately. Tailnet traffic must use the `:3130` tunnel proxy, so Muse's client config points `HTTP_PROXY` at `:3130` for the relay (or sets the relay URL's proxy explicitly).
 - Muse wake: run `tincan wait` in the background. It holds the long-poll and exits as soon as a request arrives, and Muse's runtime delivers that completion into a new turn. A cron check every few minutes backs it up.
-- Instinct wake: the relay emails Instinct's inbox (through Grok Bot's existing AgentMail inbox) unless the background-command wake works there too.
+- Instinct wake: the relay emails Instinct's inbox through Grok Bot's existing AgentMail inbox, and Instinct sets its own recurring check as a backup. Instinct cannot keep a background listener alive, so it handles requests with a quick inbox check each turn rather than a held poll.
+- Path stability: Instinct's second run, 13 minutes after a clean first run, mostly failed to connect through its SOCKS5 tailnet path. Instinct reported Grok Bot reachable only through DERP at about 214 ms, with no direct path. Treat every held poll as disposable: requests stay queued at the relay, clients reconnect with jittered backoff, and no agent depends on a long-lived connection to receive work.
 
 ### Found during the local smoke test (2026-09-22, Mac to Mac)
 
