@@ -76,6 +76,7 @@ type Server struct {
 	prep   Preparer
 	events Events
 	wake   WakeNamer
+	conn   Connector
 
 	mu       sync.Mutex
 	lastPoll map[string]time.Time
@@ -90,6 +91,18 @@ func New(dir *identity.Directory, st *store.Store, cfg Config) *Server {
 
 // SetPreparer installs the chain and policy step.
 func (s *Server) SetPreparer(p Preparer) { s.prep = p }
+
+// Connector links virtual agents (ChatGPT through the gateway).
+type Connector interface {
+	// Connect binds the virtual agent and returns a one-time login code and
+	// the public URL to add as a connector.
+	Connect(ctx context.Context, name string) (code, url string, err error)
+	// Revoke drops every token the agent holds.
+	Revoke(ctx context.Context, name string) error
+}
+
+// SetConnector enables `tincan connect`.
+func (s *Server) SetConnector(c Connector) { s.conn = c }
 
 // SetEvents installs queue event listeners.
 func (s *Server) SetEvents(e Events) { s.events = e }
@@ -118,6 +131,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/join", s.handleJoin)
 	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
 	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
+	mux.HandleFunc("POST /v1/admin/connect", s.handleConnect)
 	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
 	mux.HandleFunc("GET /v1/trace", s.handleRecent)
 	mux.HandleFunc("GET /v1/admin/audit/verify", s.handleVerify)
@@ -131,6 +145,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
 	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
+	mux.HandleFunc("POST /v1/admin/connect", s.handleConnect)
 	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
 	mux.HandleFunc("GET /v1/trace", s.handleRecent)
 	mux.HandleFunc("GET /v1/admin/audit/verify", s.handleVerify)
@@ -482,6 +497,11 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	for _, id := range ids {
 		s.hub.notify(requestKey(id))
 	}
+	if s.conn != nil {
+		if err := s.conn.Revoke(r.Context(), in.Name); err != nil {
+			log.Printf("revoke %s: %v", in.Name, err)
+		}
+	}
 	s.record(r.Context(), "removed", "", "", in.Name, store.DetailJSON(map[string]any{"cancelled": len(ids)}))
 	writeJSON(w, http.StatusOK, map[string]any{"removed": in.Name, "cancelled": len(ids)})
 }
@@ -651,4 +671,29 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "checked": n})
+}
+
+func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	if s.conn == nil {
+		writeErr(w, http.StatusNotFound, errors.New("the ChatGPT gateway is not enabled on this relay (start it with --chatgpt-gateway)"))
+		return
+	}
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Name == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("name is required"))
+		return
+	}
+	code, url, err := s.conn.Connect(r.Context(), in.Name)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.record(r.Context(), "connected", "", "", in.Name, "")
+	writeJSON(w, http.StatusOK, map[string]string{"name": in.Name, "code": code, "url": url, "expires_in": "10m0s"})
 }

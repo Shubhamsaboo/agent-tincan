@@ -79,6 +79,12 @@ func NewRelay(base, proxy string) (*Relay, error) {
 	return &Relay{base: base, api: api, polls: polls}, nil
 }
 
+// NewRelayHTTP builds a client over a caller-supplied http.Client (the
+// gateway uses an in-process transport).
+func NewRelayHTTP(base string, c *http.Client) *Relay {
+	return &Relay{base: strings.TrimRight(base, "/"), api: c, polls: c}
+}
+
 // NewRelaySocket talks to the relay's local admin socket (on the relay host).
 func NewRelaySocket(path string) *Relay {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

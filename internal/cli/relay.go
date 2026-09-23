@@ -17,6 +17,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
+	"github.com/mvanhorn/agent-tincan/internal/gateway"
 	"github.com/mvanhorn/agent-tincan/internal/identity"
 	"github.com/mvanhorn/agent-tincan/internal/policy"
 	"github.com/mvanhorn/agent-tincan/internal/relay"
@@ -30,6 +31,11 @@ type relayFlags struct {
 	stateDir string
 	port     int
 	admins   []string
+
+	gateway         bool
+	gatewayHostname string
+	gatewayListen   string
+	gatewayURL      string
 }
 
 func relayCmd() *cobra.Command {
@@ -53,6 +59,10 @@ state dir, chmod 600. They are never sent to agents.`,
 	cmd.Flags().StringVar(&f.stateDir, "state-dir", defaultStateDir(), "relay state: database, tsnet state, admin socket")
 	cmd.Flags().IntVar(&f.port, "port", 80, "port to serve the agent API on")
 	cmd.Flags().StringSliceVar(&f.admins, "admin", nil, "machine names allowed to run admin commands (e.g. macbook-pro-44,iphone182)")
+	cmd.Flags().BoolVar(&f.gateway, "chatgpt-gateway", false, "serve the public ChatGPT MCP gateway through Tailscale Funnel (OAuth-protected)")
+	cmd.Flags().StringVar(&f.gatewayHostname, "gateway-hostname", "tincan-gateway", "tsnet node name for the Funnel gateway")
+	cmd.Flags().StringVar(&f.gatewayListen, "gateway-listen", "", "serve the gateway on this plain-HTTP address instead of Funnel (put your own TLS proxy in front)")
+	cmd.Flags().StringVar(&f.gatewayURL, "gateway-url", "", "public https URL of the gateway when using --gateway-listen")
 	return cmd
 }
 
@@ -109,7 +119,7 @@ func runRelay(ctx context.Context, f relayFlags) error {
 		log.Printf("no --admin machines set: invites only work from the local admin socket")
 	}
 
-	dir := identity.NewDirectory(st, who, identity.Config{Admins: f.admins})
+	dir := identity.NewDirectory(st, identity.WithVirtual(who), identity.Config{Admins: f.admins})
 	srv := relay.New(dir, st, relay.Config{})
 	srv.SetPreparer(policy.New(st, policy.Config{}))
 	wakeCfg, err := wake.LoadConfig(filepath.Join(f.stateDir, "wake.json"))
@@ -133,9 +143,25 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	}
 	admin := client.Configure(&http.Server{Handler: srv.AdminHandler()}, client.RelayAPI)
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	go func() { errc <- api.Serve(ln) }()
 	go func() { errc <- admin.Serve(aln) }()
+	if f.gateway {
+		gln, base, closeGW, err := gatewayListener(ctx, f)
+		if err != nil {
+			return fmt.Errorf("chatgpt gateway: %w", err)
+		}
+		defer closeGW()
+		oauth, err := gateway.NewOAuth(st.DB(), nil)
+		if err != nil {
+			return err
+		}
+		srv.SetConnector(gateway.Connector{Dir: dir, OAuth: oauth, Base: base})
+		gw := client.Configure(&http.Server{Handler: gateway.New(base, oauth, srv.Handler(), Version).Handler()}, client.RelayAPI)
+		go func() { errc <- gw.Serve(gln) }()
+		defer gw.Close()
+		log.Printf("chatgpt gateway serving at %s/mcp", base)
+	}
 	log.Printf("tincan relay serving on %s (admin socket %s)", ln.Addr(), adminSock)
 
 	select {
@@ -148,4 +174,31 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	api.Close()
 	admin.Close()
 	return nil
+}
+
+// gatewayListener returns the public listener and base URL for the ChatGPT
+// gateway: a Funnel listener on its own tsnet node by default.
+func gatewayListener(ctx context.Context, f relayFlags) (net.Listener, string, func(), error) {
+	if f.gatewayListen != "" {
+		if f.gatewayURL == "" {
+			return nil, "", nil, fmt.Errorf("--gateway-url is required with --gateway-listen")
+		}
+		ln, err := net.Listen("tcp", f.gatewayListen)
+		return ln, f.gatewayURL, func() {}, err
+	}
+	ts := &tsnet.Server{Hostname: f.gatewayHostname, Dir: filepath.Join(f.stateDir, "tsnet-gateway"), AuthKey: os.Getenv("TS_AUTHKEY")}
+	if _, err := ts.Up(ctx); err != nil {
+		return nil, "", nil, err
+	}
+	ln, err := ts.ListenFunnel("tcp", ":443")
+	if err != nil {
+		ts.Close()
+		return nil, "", nil, fmt.Errorf("%w (Funnel needs HTTPS certificates and the funnel node attribute in your tailnet policy)", err)
+	}
+	domains := ts.CertDomains()
+	if len(domains) == 0 {
+		ts.Close()
+		return nil, "", nil, errors.New("no HTTPS domain for the gateway node; enable HTTPS certificates in the Tailscale admin console")
+	}
+	return ln, "https://" + domains[0], func() { ts.Close() }, nil
 }

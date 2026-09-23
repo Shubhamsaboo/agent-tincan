@@ -21,6 +21,7 @@ import (
 type Mesh struct {
 	Server *relay.Server
 	Store  *store.Store
+	Dir    *identity.Directory
 	urls   map[string]string
 }
 
@@ -40,10 +41,11 @@ func New(t *testing.T, cfg relay.Config) *Mesh {
 		addrs["instinct"]: {ID: "nINST", Name: "instinct"},
 		addrs["muse"]:     {ID: "nMUSE", Name: "muse"},
 	})
-	dir := identity.NewDirectory(st, who, identity.Config{Admins: []string{"macbook-pro-44"}})
+	dir := identity.NewDirectory(st, identity.WithVirtual(who), identity.Config{Admins: []string{"macbook-pro-44"}})
+	m0 := dir
 	srv := relay.New(dir, st, cfg)
 	srv.SetPreparer(policy.New(st, policy.Config{}))
-	m := &Mesh{Server: srv, Store: st, urls: map[string]string{}}
+	m := &Mesh{Server: srv, Store: st, Dir: m0, urls: map[string]string{}}
 	h := srv.Handler()
 	for name, addr := range addrs {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
