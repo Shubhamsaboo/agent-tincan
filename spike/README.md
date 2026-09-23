@@ -37,12 +37,22 @@ For question 4, find out on Muse: does a background process survive between turn
 
 ## Findings
 
+Run 2026-09-22 with a small Python hold server on the Grok Bot VM (100.104.237.47:8080) standing in for spike-relay, because the private repo's binaries could not be fetched by the agents. Same questions, same method.
+
 | Question | Grok Bot | Instinct | Muse |
 |---|---|---|---|
-| Connects | pending | pending | pending |
-| Longest hold that survives | pending | pending | pending |
-| `WhoIs` node | pending | pending | pending |
-| Wake method | webhook (planned) | e2b resume (planned) | pending |
+| Connects | yes (local) | yes, direct over the tailnet | yes, through `hatch-egress-proxy:3130` (the Tailscale tunnel outside its container) |
+| Longest hold that survived | n/a | 120 s (every step 10 to 120 s answered) | 30 s confirmed; the 60 s hold was still open when the server was stopped, so its outcome is unknown |
+| `WhoIs` node | grok-bot, nSxH3XiLDr11CNTRL | instinct, ntiLg1kJwr11CNTRL | muse, neDzL7Y5AX11CNTRL |
+| Wake without a human | relay calls its webhook (planned) | email to its inbox, or a scheduled wake it sets itself (no API); background-command wake pending confirmation | background shell command completion is delivered into a new turn, and background processes survive across turns |
+
+Conclusions for the build:
+
+- Stop conditions cleared: each agent reaches a relay on the Grok Bot VM, `WhoIs` returns a distinct node for each (Muse included, even through its tunnel proxy), and the Grok Bot VM kept a server up for the whole test.
+- Keep the 25 s long-poll hold. It is under the 30 s Muse hold that was confirmed.
+- Muse's normal egress proxy (`hatch-egress-proxy:3128`) rejects tailnet addresses immediately. Tailnet traffic must use the `:3130` tunnel proxy, so Muse's client config points `HTTP_PROXY` at `:3130` for the relay (or sets the relay URL's proxy explicitly).
+- Muse wake: run `tincan wait` in the background. It holds the long-poll and exits as soon as a request arrives, and Muse's runtime delivers that completion into a new turn. A cron check every few minutes backs it up.
+- Instinct wake: the relay emails Instinct's inbox (through Grok Bot's existing AgentMail inbox) unless the background-command wake works there too.
 
 ### Found during the local smoke test (2026-09-22, Mac to Mac)
 
