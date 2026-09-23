@@ -133,7 +133,7 @@ func TestOperatorPromptFollowsFormula(t *testing.T) {
 	headings := []string{"Name: Agent Tincan", "ONLY job:", "Team:", "Relay: " + relayURL, "Operator host: grokbot",
 		"tincan binary:", "Identity:", "How:", "Relay health:", "Agent presence:", "Wake health:", "Queue depth:",
 		"Trace / summary:", "Invites:", "Remove agents:", "Join / wake troubleshooting:", "Wake:", "Voice:",
-		"Anti-jobs:", "Troubleshooting (in order):", "When reporting, use this shape and stop:", "Needs Matt:"}
+		"Anti-jobs:", "Troubleshooting (in order):", "When Matt asks for status, use this shape and stop:", "Needs Matt:"}
 	pos := 0
 	for _, h := range headings {
 		i := strings.Index(p[pos:], h)
@@ -148,6 +148,7 @@ func TestOperatorPromptFollowsFormula(t *testing.T) {
 		"tincan remove <name>", "tincan audit-verify", "tincan agents",
 		"wake is wait or command keep a poller running", "offline for more than 10 minutes", "its loop has probably died",
 		"tincan upgrade",
+		"silent standing check", "never messages Matt, even when it finds a problem", "never message Matt unprompted",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("operator prompt missing %q", want)
