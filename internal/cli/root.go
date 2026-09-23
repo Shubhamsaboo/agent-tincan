@@ -17,6 +17,8 @@ func Root() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.AddCommand(relayCmd(), versionCmd())
+	root.AddCommand(agentCmds()...)
+	root.AddCommand(mcpCmd())
 	return root
 }
 
