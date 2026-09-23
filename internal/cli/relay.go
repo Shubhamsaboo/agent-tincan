@@ -18,6 +18,7 @@ import (
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/identity"
+	"github.com/mvanhorn/agent-tincan/internal/policy"
 	"github.com/mvanhorn/agent-tincan/internal/relay"
 	"github.com/mvanhorn/agent-tincan/internal/store"
 )
@@ -106,6 +107,7 @@ func runRelay(ctx context.Context, f relayFlags) error {
 
 	dir := identity.NewDirectory(st, who, identity.Config{Admins: f.admins})
 	srv := relay.New(dir, st, relay.Config{})
+	srv.SetPreparer(policy.New(st, policy.Config{}))
 	go srv.Run(ctx)
 
 	api := client.Configure(&http.Server{Handler: srv.Handler()}, client.RelayAPI)
