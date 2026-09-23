@@ -75,7 +75,12 @@ type noIn struct{}
 
 // New builds the MCP server over a relay backend.
 func New(b Backend, version string) *mcp.Server {
-	s := mcp.NewServer(&mcp.Implementation{Name: "agent-tincan", Version: version}, &mcp.ServerOptions{Instructions: Instructions})
+	return NewWithOptions(b, version, &mcp.ServerOptions{Instructions: Instructions})
+}
+
+// NewWithOptions builds the MCP server with explicit options (channel mode).
+func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions) *mcp.Server {
+	s := mcp.NewServer(&mcp.Implementation{Name: "agent-tincan", Version: version}, opts)
 
 	mcp.AddTool(s, &mcp.Tool{Name: "ask", Description: "Ask a teammate agent to do something or answer something. Waits up to wait_seconds for the reply, otherwise returns a request id to check with get_reply."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, any, error) {
