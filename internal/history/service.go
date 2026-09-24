@@ -27,7 +27,9 @@ const launchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!--
   Agent Tincan history agent: runs "tincan history serve" under launchd,
   outside any Codex sandbox. "tincan history install" copies this file into
-  ~/Library/LaunchAgents with the real paths filled in. It does not load it;
+  ~/Library/LaunchAgents with the real paths filled in, PATH included: it
+  starts with the directories of codex (the query step) and claude (the
+  Claude in Chrome route, normally ~/.local/bin). It does not load it;
   start it with:
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agenttincan.history.plist
   See docs/adapters/history.md.
@@ -81,7 +83,7 @@ RestartSec=10
 WantedBy=default.target
 `
 
-// basePath is the service's PATH after the codex directory.
+// basePath is the service's PATH after the codex and claude directories.
 const basePath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 // ServiceOptions controls InstallService. Zero fields take the current
@@ -93,6 +95,11 @@ type ServiceOptions struct {
 	// CodexDir is put first on the service's PATH so it finds codex (the
 	// query extractor). Default: the directory of codex on PATH, if any.
 	CodexDir string
+	// ClaudeDir is put on the service's PATH so it finds claude (the Claude
+	// in Chrome route). Default: the directory of claude on PATH, if any.
+	// ~/.local/bin, where Claude Code's installer puts claude, is always on
+	// the PATH.
+	ClaudeDir string
 	// UID fills the printed launchctl command (default: os.Getuid()).
 	UID int
 }
@@ -132,10 +139,15 @@ func InstallService(o ServiceOptions) (ServiceResult, error) {
 			o.CodexDir = filepath.Dir(p)
 		}
 	}
+	if o.ClaudeDir == "" {
+		if p, err := exec.LookPath("claude"); err == nil {
+			o.ClaudeDir = filepath.Dir(p)
+		}
+	}
 	if o.UID == 0 {
 		o.UID = os.Getuid()
 	}
-	path := servicePath(o.CodexDir)
+	path := servicePath(o.CodexDir, o.ClaudeDir, filepath.Join(o.Home, ".local", "bin"))
 	switch o.GOOS {
 	case "darwin":
 		dst := filepath.Join(o.Home, "Library", "LaunchAgents", ServiceLabel+".plist")
@@ -162,10 +174,14 @@ func InstallService(o ServiceOptions) (ServiceResult, error) {
 	return ServiceResult{}, errors.New("no history service definition for " + o.GOOS + "; run tincan history serve under your own service manager")
 }
 
-func servicePath(codexDir string) string {
-	parts := strings.Split(basePath, ":")
-	if codexDir != "" && !strings.ContainsAny(codexDir, ":\n\r") && !slices.Contains(parts, codexDir) {
-		parts = append([]string{codexDir}, parts...)
+// servicePath is dirs, in order, then basePath, without duplicates or
+// directories that cannot be PATH entries.
+func servicePath(dirs ...string) string {
+	var parts []string
+	for _, d := range append(dirs, strings.Split(basePath, ":")...) {
+		if d != "" && filepath.IsAbs(d) && !strings.ContainsAny(d, ":\n\r") && !slices.Contains(parts, d) {
+			parts = append(parts, d)
+		}
 	}
 	return strings.Join(parts, ":")
 }

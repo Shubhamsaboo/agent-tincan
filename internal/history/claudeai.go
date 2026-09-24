@@ -12,9 +12,14 @@ import (
 // extension finds the organization with /api/organizations, then calls
 // /api/organizations/<org>/chat_conversations (list), the conversation
 // detail with tree=True&rendering_mode=messages, and
-// /api/<org>/files/<file>/preview for images.
+// /api/<org>/files/<file>/preview for images. When the extension is not
+// connected, Chrome (the claude-chrome route) runs the same fetches in one
+// fixed script.
 type ClaudeAI struct {
 	Client *Client
+	// Chrome is the claude-chrome route, used when the extension is not
+	// connected. Nil means none.
+	Chrome *ClaudeChrome
 	Window Window
 	Now    func() time.Time
 }
@@ -28,7 +33,8 @@ func (r *ClaudeAI) Source() Source { return SourceClaudeAI }
 func (r *ClaudeAI) live() *live {
 	return &live{
 		source:      SourceClaudeAI,
-		client:      r.Client,
+		fetch:       nativeFetcher{r.Client},
+		chrome:      r.Chrome,
 		window:      r.Window,
 		now:         r.Now,
 		listOp:      OpClaudeAIList,

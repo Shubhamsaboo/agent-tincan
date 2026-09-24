@@ -250,7 +250,8 @@ func (e *UnavailableError) Error() string {
 	case ErrChromeNotRunning:
 		reason = "Chrome is not running"
 	case ErrExtensionNotConnected:
-		reason = "the Tincan Chrome extension is not connected (install it, then run tincan history install)"
+		reason = "the Tincan Chrome extension is not connected (install it, then run tincan history install), " +
+			"and no claude binary was found for the Claude in Chrome route (Claude Code logged in with a claude.ai plan, plus the Claude in Chrome extension, would also work)"
 	case ErrNotLoggedIn:
 		reason = "not logged in to " + site + " in Chrome"
 	case ErrEndpointChanged:
@@ -259,6 +260,8 @@ func (e *UnavailableError) Error() string {
 		reason = "Chrome did not answer in time"
 	case ErrRejected:
 		reason = "the extension rejected the request"
+	case ErrClaudeChrome:
+		reason = "Claude in Chrome could not run the read"
 	default:
 		reason = site + " request failed"
 	}

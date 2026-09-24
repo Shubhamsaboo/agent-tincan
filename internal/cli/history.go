@@ -20,15 +20,18 @@ import (
 var historyNow = time.Now
 
 // historyReader returns the reader for a source name. The live sources go
-// through the Tincan Chrome extension's native host.
-func historyReader(source string) (history.Reader, error) {
+// through the Tincan Chrome extension's native host when it is connected,
+// else through Claude in Chrome with the claude binary claudeBin.
+func historyReader(source, claudeBin string) (history.Reader, error) {
 	switch history.Source(source) {
 	case history.SourceChatGPT:
 		r := history.NewChatGPT(history.NewClient())
+		r.Chrome = history.NewClaudeChrome(claudeBin)
 		r.Now = historyNow
 		return r, nil
 	case history.SourceClaudeAI:
 		r := history.NewClaudeAI(history.NewClient())
+		r.Chrome = history.NewClaudeChrome(claudeBin)
 		r.Now = historyNow
 		return r, nil
 	case history.SourceCodex:
@@ -52,7 +55,8 @@ func historyCmd() *cobra.Command {
 		Short: "Read Matt's ChatGPT, claude.ai, Codex or Claude Code history",
 		Long: "Read Matt's ChatGPT, claude.ai, Codex or Claude Code history. With no mode flag it shows the latest prompt Matt typed.\n" +
 			"Unattended runs (codex exec wakes, Claude Code SDK sessions) are left out unless --all is given.\n" +
-			"chatgpt and claude-ai are read live through the Tincan Chrome extension and the user's logged-in Chrome; run tincan history install once.",
+			"chatgpt and claude-ai are read live in the user's logged-in Chrome: through the Tincan Chrome extension when it is connected\n" +
+			"(run tincan history install once), else through Claude Code's Claude in Chrome (claude -p --chrome; $TINCAN_HISTORY_CLAUDE names the binary).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			modes := 0
@@ -67,7 +71,7 @@ func historyCmd() *cobra.Command {
 			if modes > 1 {
 				return errors.New("use only one of --list, --latest, --search, --id")
 			}
-			r, err := historyReader(args[0])
+			r, err := historyReader(args[0], history.DefaultClaudeBinary())
 			if err != nil {
 				return err
 			}
@@ -173,14 +177,15 @@ func defaultHistoryConfig() string {
 }
 
 func historyServeCmd() *cobra.Command {
-	var configPath, allowPath, codexBin string
+	var configPath, allowPath, codexBin, claudeBin string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the history agent: answer teammates' history questions over the relay",
 		Long: "Long-polls the relay as the history agent and answers each request itself, in order:\n" +
 			"  1. every agent in the request's relay-set chain must be on the allowlist, or the request is declined;\n" +
 			"  2. a tool-less codex exec call turns the question text (and only that) into a structured query;\n" +
-			"  3. the matching source is read (ChatGPT and claude.ai through the Tincan Chrome extension);\n" +
+			"  3. the matching source is read (ChatGPT and claude.ai through the Tincan Chrome extension, or through\n" +
+			"     Claude in Chrome when the extension is not connected: claude runs one fixed script and never sees chat content);\n" +
 			"  4. the reply is filled in from a fixed template, with the images attached.\n" +
 			"Retrieved chat content is never sent to an LLM. The allowlist file is reread for every request.\n" +
 			"Normally started by the service definition tincan history install writes. See docs/adapters/history.md.",
@@ -217,7 +222,7 @@ func historyServeCmd() *cobra.Command {
 			}
 			readers := map[history.Source]history.Reader{}
 			for _, src := range history.Sources {
-				rd, err := historyReader(string(src))
+				rd, err := historyReader(string(src), claudeBin)
 				if err != nil {
 					return err
 				}
@@ -255,6 +260,7 @@ func historyServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&configPath, "config", "", "the history agent's client config (default: $TINCAN_CONFIG, else ~/.config/tincan/history.json)")
 	cmd.Flags().StringVar(&allowPath, "allowlist", "", "file of agents allowed to read history, one per line (default: ~/.config/tincan/history-allow.txt; missing means grokbot, claude-code, codex)")
 	cmd.Flags().StringVar(&codexBin, "codex", "codex", "codex binary used for the tool-less query step")
+	cmd.Flags().StringVar(&claudeBin, "claude", history.DefaultClaudeBinary(), "claude binary for the Claude in Chrome route, used when the Tincan extension is not connected (default: $TINCAN_HISTORY_CLAUDE, else claude on PATH)")
 	return cmd
 }
 

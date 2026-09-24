@@ -21,7 +21,7 @@ func TestExamplePlistIsTheInstallTemplate(t *testing.T) {
 
 func TestInstallServiceDarwin(t *testing.T) {
 	home := t.TempDir()
-	res, err := InstallService(ServiceOptions{GOOS: "darwin", Home: home, Binary: "/opt/it's <here>/tincan", CodexDir: "/opt/homebrew/bin", UID: 501})
+	res, err := InstallService(ServiceOptions{GOOS: "darwin", Home: home, Binary: "/opt/it's <here>/tincan", CodexDir: "/opt/homebrew/bin", ClaudeDir: "/opt/claude/bin", UID: 501})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestInstallServiceDarwin(t *testing.T) {
 		"/opt/it's <here>/tincan|history|serve",
 		home + "/.config/tincan/history.json",
 		home + "/Library/Logs/tincan-history.log",
-		"/opt/homebrew/bin:",
+		"/opt/homebrew/bin:/opt/claude/bin:" + home + "/.local/bin:/usr/local/bin:/usr/bin:/bin",
 		"KeepAlive",
 	} {
 		if !strings.Contains(joined, want) {
@@ -98,5 +98,24 @@ func TestInstallServiceRejectsUnsafeBinary(t *testing.T) {
 	}
 	if _, err := InstallService(ServiceOptions{GOOS: "windows", Home: t.TempDir(), Binary: `C:\tincan.exe`}); err == nil {
 		t.Error("windows accepted; there is no service definition for it")
+	}
+}
+
+// The service PATH finds codex and claude: their directories first, then
+// ~/.local/bin (Claude Code's installer), then the base PATH, deduplicated.
+func TestServicePath(t *testing.T) {
+	cases := []struct {
+		dirs []string
+		want string
+	}{
+		{nil, basePath},
+		{[]string{"/h/.local/bin/codexdir", "/h/.local/bin", "/h/.local/bin"}, "/h/.local/bin/codexdir:/h/.local/bin:" + basePath},
+		{[]string{"/opt/homebrew/bin", "", "/h/.local/bin"}, "/opt/homebrew/bin:/h/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+		{[]string{"relative/bin", "/bad:dir", "/bad\ndir", "/ok"}, "/ok:" + basePath},
+	}
+	for _, c := range cases {
+		if got := servicePath(c.dirs...); got != c.want {
+			t.Errorf("servicePath(%q) = %s, want %s", c.dirs, got, c.want)
+		}
 	}
 }

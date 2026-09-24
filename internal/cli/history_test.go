@@ -30,6 +30,8 @@ func historyEnv(t *testing.T) (codexHome, claudeDir string) {
 	t.Setenv("CODEX_HOME", codexHome)
 	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
 	t.Setenv("TINCAN_HISTORY_SCRATCH", "/Users/matt/.config/tincan/history-scratch")
+	// Never the real claude: the Claude in Chrome route has no binary.
+	t.Setenv("TINCAN_HISTORY_CLAUDE", filepath.Join(base, "no-such-claude"))
 	old := historyNow
 	historyNow = func() time.Time { return time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC) }
 	t.Cleanup(func() { historyNow = old })
@@ -187,8 +189,8 @@ func TestHistoryLiveSourceUnavailable(t *testing.T) {
 	t.Setenv("TINCAN_HISTORY_NATIVE_DIR", t.TempDir())
 	for _, src := range []string{"chatgpt", "claude-ai"} {
 		out, err := run(t, Root(), "history", src)
-		if err == nil || !strings.Contains(err.Error(), "source unavailable: "+src+": ") {
-			t.Fatalf("%s: want source unavailable, got %v\n%s", src, err, out)
+		if err == nil || !strings.Contains(err.Error(), "source unavailable: "+src+": ") || strings.Contains(err.Error(), "Claude in Chrome could not run") {
+			t.Fatalf("%s: want source unavailable without a claude run, got %v\n%s", src, err, out)
 		}
 	}
 }
@@ -231,7 +233,7 @@ func TestHistoryServeFlagsAndMissingConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--config", "--allowlist", "--codex"} {
+	for _, want := range []string{"--config", "--allowlist", "--codex", "--claude", "Claude in Chrome"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("serve help missing %s:\n%s", want, out)
 		}

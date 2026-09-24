@@ -12,9 +12,13 @@ import (
 // extension calls GET /api/auth/session inside the browser for the access
 // token (it never leaves the extension), then /backend-api/conversations
 // (list), /backend-api/conversation/<id> (detail) and the files download
-// endpoint for image pointers.
+// endpoint for image pointers. When the extension is not connected, Chrome
+// (the claude-chrome route) runs the same fetches in one fixed script.
 type ChatGPT struct {
 	Client *Client
+	// Chrome is the claude-chrome route, used when the extension is not
+	// connected. Nil means none.
+	Chrome *ClaudeChrome
 	Window Window
 	Now    func() time.Time
 }
@@ -28,7 +32,8 @@ func (r *ChatGPT) Source() Source { return SourceChatGPT }
 func (r *ChatGPT) live() *live {
 	return &live{
 		source:      SourceChatGPT,
-		client:      r.Client,
+		fetch:       nativeFetcher{r.Client},
+		chrome:      r.Chrome,
 		window:      r.Window,
 		now:         r.Now,
 		listOp:      OpChatGPTList,

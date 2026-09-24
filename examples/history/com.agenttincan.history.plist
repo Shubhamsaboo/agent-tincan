@@ -3,7 +3,9 @@
 <!--
   Agent Tincan history agent: runs "tincan history serve" under launchd,
   outside any Codex sandbox. "tincan history install" copies this file into
-  ~/Library/LaunchAgents with the real paths filled in. It does not load it;
+  ~/Library/LaunchAgents with the real paths filled in, PATH included: it
+  starts with the directories of codex (the query step) and claude (the
+  Claude in Chrome route, normally ~/.local/bin). It does not load it;
   start it with:
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agenttincan.history.plist
   See docs/adapters/history.md.

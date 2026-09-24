@@ -325,8 +325,8 @@ func TestSourceUnavailableMessages(t *testing.T) {
 		want string
 	}{
 		{"chrome not running", errChannel(ErrChromeNotRunning), ErrChromeNotRunning, "source unavailable: chatgpt: Chrome is not running"},
-		{"extension not connected", errChannel(ErrExtensionNotConnected), ErrExtensionNotConnected, "source unavailable: chatgpt: the Tincan Chrome extension is not connected (install it, then run tincan history install)"},
-		{"host closed", frames(), ErrExtensionNotConnected, "source unavailable: chatgpt: the Tincan Chrome extension is not connected (install it, then run tincan history install)"},
+		{"extension not connected", errChannel(ErrExtensionNotConnected), ErrExtensionNotConnected, notConnectedMsg},
+		{"host closed", frames(), ErrExtensionNotConnected, notConnectedMsg},
 		{"not logged in", frames(NativeResponse{Error: &NativeError{Code: "not_logged_in", Message: "401"}}), ErrNotLoggedIn, "source unavailable: chatgpt: not logged in to chatgpt.com in Chrome"},
 		{"endpoint changed", frames(NativeResponse{Error: &NativeError{Code: "endpoint_changed", Message: "404"}}), ErrEndpointChanged, "source unavailable: chatgpt: chatgpt.com changed its API (404)"},
 		{"blocked", frames(NativeResponse{Error: &NativeError{Code: "blocked", Message: "403 challenge"}}), ErrEndpointChanged, "source unavailable: chatgpt: chatgpt.com changed its API (blocked: 403 challenge)"},
@@ -353,6 +353,9 @@ func TestSourceUnavailableMessages(t *testing.T) {
 		})
 	}
 }
+
+const notConnectedMsg = "source unavailable: chatgpt: the Tincan Chrome extension is not connected (install it, then run tincan history install), " +
+	"and no claude binary was found for the Claude in Chrome route (Claude Code logged in with a claude.ai plan, plus the Claude in Chrome extension, would also work)"
 
 func errChannel(err error) Channel { return errCh{err} }
 

@@ -78,8 +78,10 @@ const (
 	maxPromptsInConv = 20
 )
 
-// DefaultRequestTimeout bounds the handling of one request.
-const DefaultRequestTimeout = 3 * time.Minute
+// DefaultRequestTimeout bounds the handling of one request: room for the
+// query step, one claude-chrome run (DefaultClaudeChromeTimeout) and the
+// wait for its result file.
+const DefaultRequestTimeout = 5 * time.Minute
 
 // clarifyExample is the one-line example in a clarifying reply.
 const clarifyExample = `For example: "what was the last thing Matt asked ChatGPT? send the image"`
