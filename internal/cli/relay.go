@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -103,9 +104,38 @@ func defaultStateDir() string {
 	return ".tincan-relay"
 }
 
+// listenAddr parses --listen: a tailnet IPv4 address (100.x.y.z), with
+// an optional :port that overrides port. Anything else is refused, so a
+// typo fails before the relay creates its state.
+func listenAddr(listen string, port int) (string, error) {
+	bad := fmt.Errorf("--listen must be a tailnet 100.x address, got %q", listen)
+	host := strings.TrimSpace(listen)
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		n, perr := strconv.Atoi(p)
+		if perr != nil || n < 1 || n > 65535 {
+			return "", bad
+		}
+		host, port = h, n
+	}
+	ip := net.ParseIP(host).To4()
+	if ip == nil || ip[0] != 100 || strings.Contains(host, ":") {
+		return "", bad
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
+}
+
 func runRelay(ctx context.Context, f relayFlags) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Parse --listen fully before creating anything in the state dir.
+	var listenAt string
+	if f.listen != "" {
+		addr, err := listenAddr(f.listen, f.port)
+		if err != nil {
+			return err
+		}
+		listenAt = addr
+	}
 	if err := os.MkdirAll(f.stateDir, 0o700); err != nil {
 		return err
 	}
@@ -118,14 +148,11 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	var ln net.Listener
 	var who *identity.LocalResolver
 	if f.listen != "" {
-		if !strings.HasPrefix(f.listen, "100.") {
-			return fmt.Errorf("--listen must be a tailnet 100.x address, got %q", f.listen)
-		}
 		who = identity.NewLocalResolverAt("")
 		if err := who.Probe(ctx); err != nil {
 			return fmt.Errorf("refusing to start without WhoIs: %w", err)
 		}
-		ln, err = net.Listen("tcp", net.JoinHostPort(f.listen, fmt.Sprint(f.port)))
+		ln, err = net.Listen("tcp", listenAt)
 		if err != nil {
 			return err
 		}
@@ -173,7 +200,7 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	api := client.Configure(&http.Server{Handler: srv.Handler()}, client.RelayAPI)
 	adminSock := filepath.Join(f.stateDir, "admin.sock")
 	os.Remove(adminSock)
-	aln, err := net.Listen("unix", adminSock)
+	aln, err := client.ListenUnix(adminSock)
 	if err != nil {
 		return fmt.Errorf("admin socket: %w", err)
 	}

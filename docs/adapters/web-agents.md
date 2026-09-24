@@ -2,14 +2,18 @@
 
 A web agent makes chatgpt.com or claude.ai a teammate. Another agent asks it something with `tincan ask chatgpt-web "..."` and gets ChatGPT's answer back as the reply, with any images ChatGPT generated attached. `claude-web` does the same with Claude on claude.ai.
 
-It is a Go service, `tincan web serve --site chatgpt` (or `--site claude-ai`), running on Matt's Mac next to Chrome. It is not a model. For each request it:
+It is a Go service, `tincan web serve --site chatgpt` (or `--site claude-ai`), running on your Mac next to Chrome. It is not a model. For each request it:
 
 1. Checks access. Every agent in the request's chain, as the relay recorded it, must be on the allowlist. Otherwise it declines and names the agent.
 2. Reads the optional threading line (below). The rest of the body is the message, sent as is.
 3. Has the Tincan Chrome extension type the message into the site, in a background tab the extension opens itself. The extension answers as soon as the message is sent and the conversation id is in the tab's address.
-4. Reads the conversation every 2 seconds through the same detail operation the history agent uses until the reply is finished (bounded by the request timeout, 8 minutes), then replies with the answer text and the generated images, fetched through the file operation, as attachments. Then it has the extension close the tab.
+4. Reads the conversation through the same detail operation the history agent uses until the reply is finished (bounded by the request timeout, 8 minutes), then replies with the answer text and the generated images, fetched through the file operation, as attachments. Then it has the extension close the tab. The first read is 5 seconds after the send, then the reads back off: 5, 8 and 12 seconds apart, then every 20 seconds. Every read is a request on your account, so it never polls faster than that.
 
-It handles one request at a time. The extension also runs one send per site at a time.
+It handles one request at a time. The extension also runs one send per site at a time. While a request waits for its answer, the agent refreshes its relay presence every 30 seconds with a peek that claims nothing, so it does not show offline; requests that arrive meanwhile stay queued for the next one.
+
+## Rate limits
+
+If the site answers HTTP 429, the agent waits the site's `Retry-After` (the extension reports it), or backs off from 30 seconds, doubling up to 5 minutes. It never retries at the normal cadence. If that wait would outlast the request's 8 minutes, the request fails with "ChatGPT is rate-limiting this account right now. The message was sent to ChatGPT (conversation <id>); ask for the reply later instead of sending it again." (or claude.ai): the message already went through, so sending it again would only duplicate it. While the cooldown runs, the next request fails at once, before anything is sent, with "ChatGPT is rate-limiting this account right now; try again later" instead of asking the site again. The native host keeps the same cooldown for every reader and agent that goes through it, so history reads also stop hitting the site; a history read that meets a 429 fails at once with that message, without retrying. An HTTP 5xx while waiting also backs off (doubling, up to 2 minutes).
 
 ## What it does in your browser
 
@@ -54,29 +58,29 @@ Every reply ends with the conversation id, for example `ChatGPT conversation: 6a
 
 ## Install
 
-The web agents use the Tincan Chrome extension and its native host, the same ones the history agent uses. If you already run `history`, that part is done.
+The web agents use the Tincan Chrome extension and its native host, the same ones the history agent uses. If you already run `history`, that part is done. Otherwise load the extension first as described in [history.md](history.md#install) (unzip `tincan-history-extension.zip` into a folder you keep, then Load unpacked in `chrome://extensions` with Developer mode on).
 
 ```bash
 tincan invite chatgpt-web --kind chatgpt-web          # on an admin device
 TINCAN_CONFIG=~/.config/tincan/chatgpt-web.json tincan join <code> --relay http://tincan-relay
-tincan history install --no-service                   # skip if history is installed
+tincan history install --no-service --extension-dir ~/tincan-extension   # skip if history is installed
 tincan web install --site chatgpt
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agenttincan.web.chatgpt.plist
 ```
 
 For Claude, use `claude-web`, `--kind claude-web`, `~/.config/tincan/claude-web.json` and `--site claude-ai` (plist `com.agenttincan.web.claude-ai.plist`).
 
-`tincan web install` writes the launchd agent (a systemd user unit on Linux, `tincan-chatgpt-web.service`) and prints the command that starts it. It never starts anything itself. The service logs to `~/Library/Logs/tincan-chatgpt-web.log`. It refuses to start unless the relay confirms it is `chatgpt-web` (or the name given with `--name`), so a config for another agent can never claim that agent's requests. Flags for running by hand: `--site`, `--name`, `--config`, `--allowlist`, `--state`.
+`tincan web install` writes the launchd agent (a systemd user unit on Linux, `tincan-chatgpt-web.service`) and prints the command that starts it. It never starts anything itself. On a headless Linux box, run `loginctl enable-linger $USER` once so the user service keeps running after you log out. The service logs to `~/Library/Logs/tincan-chatgpt-web.log`. It refuses to start unless the relay confirms it is `chatgpt-web` (or the name given with `--name`), so a config for another agent can never claim that agent's requests. Flags for running by hand: `--site`, `--name`, `--config`, `--allowlist`, `--state`.
 
 Set its wake method to `wait` in the relay's `wake.json`; the service long-polls. `tincan onboard` prints these steps for the `chatgpt-web` and `claude-web` kinds.
 
 ### Extension updates
 
-The send operations need extension version 0.3.0 or later (0.2.0 waited for the answer on the page). Load `extension/` unpacked once from `chrome://extensions`. After that, updates need no Reload click: run `tincan history install` from the repo checkout (or pass `--extension-dir <path to extension/>`), and whenever the extension connects, the native host compares its version and file hashes with the files on disk and, if they differ, sends the fixed `extension.reload` operation. The extension hashes its files once when its worker starts, so the hashes describe the code Chrome loaded even after the files on disk change. On `extension.reload` it calls `chrome.runtime.reload()` and Chrome re-reads the files, but not while a send is typing in a tab or a finished send's tab is waiting to be closed (a reload would lose track of those tabs): it checks again every 5 seconds for up to 5 minutes. At that cap it closes the finished sends' tabs and reloads anyway; a send still typing then is abandoned, its tab stays open, and that request fails when its wait times out. The host asks at most once per 10 minutes for the same files, so a copy loaded from somewhere else cannot cause a reload loop. A store install is never reloaded this way.
+The send operations need extension version 0.3.0 or later (0.2.0 waited for the answer on the page). Load the extension unpacked once from `chrome://extensions` (the unzipped `tincan-history-extension.zip`, or `extension/` in a repo checkout). After that, updates need no Reload click: run `tincan history install --extension-dir <the folder you loaded>` (or run it from a repo checkout), and whenever the extension connects (and every 10 minutes while it stays connected), the native host compares its version and file hashes with the files on disk and, if they differ, sends the fixed `extension.reload` operation. The extension hashes its files once when its worker starts, so the hashes describe the code Chrome loaded even after the files on disk change. On `extension.reload` it calls `chrome.runtime.reload()` and Chrome re-reads the files, but not while a send is typing in a tab or a finished send's tab is waiting to be closed (a reload would lose track of those tabs): it checks again every 5 seconds for up to 5 minutes. At that cap it closes the finished sends' tabs and reloads anyway; a send still typing then is abandoned, its tab stays open, and that request fails when its wait times out. The host asks at most once per 10 minutes for the same files when the extension connects, and the 10 minute re-check never asks again for files it already asked about, so a copy loaded from somewhere else cannot cause a reload loop; only the files changing again, or a reconnect, asks again. A store install is never reloaded this way.
 
 ## Troubleshooting
 
-- "Declined: X is not on the chatgpt-web allowlist": add X to `~/.config/tincan/chatgpt-web-allow.txt` if Matt wants it to act as him in ChatGPT.
+- "Declined: X is not on the chatgpt-web allowlist": add X to `~/.config/tincan/chatgpt-web-allow.txt` if you want it to act as you in ChatGPT.
 - "Declined: this request came through X": an allowed agent passed on X's request. Every agent in the chain must be allowed.
 - "source unavailable: chatgpt: not logged in to chatgpt.com in Chrome" (or claude.ai): log in in Chrome. The extension checks the session before it opens a tab, so a logged-out browser never sends anonymously.
 - "source unavailable: ...: the Tincan Chrome extension is not connected": install or enable the extension, then run `tincan history install`.

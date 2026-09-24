@@ -28,19 +28,6 @@ import (
 // wait for the reply to finish, and the reads after it.
 const DefaultWebRequestTimeout = 8 * time.Minute
 
-// DefaultWebPollInterval is how often the conversation is read while the
-// reply is being written.
-const DefaultWebPollInterval = 2 * time.Second
-
-// DefaultClaudeStablePolls and DefaultClaudeStableFor: a claude.ai reply
-// with no stop_reason is finished once the same text is read on 4
-// consecutive polls spanning at least 10 seconds, so a pause mid-reply is
-// not taken for the end.
-const (
-	DefaultClaudeStablePolls = 4
-	DefaultClaudeStableFor   = 10 * time.Second
-)
-
 // webClockSkew is how much earlier than the extension's submitted_at the
 // site may date the new message and still have it count as this send's.
 const webClockSkew = 2 * time.Minute
@@ -115,8 +102,9 @@ type WebAgent struct {
 	TempDir        string
 	Hold           time.Duration
 	RequestTimeout time.Duration
-	// PollInterval is how often the conversation is read while waiting
-	// for the reply (DefaultWebPollInterval when zero).
+	// PollInterval, when set, reads the conversation at this fixed
+	// interval while waiting for the reply instead of on
+	// DefaultWebPollSchedule (tests use it).
 	PollInterval time.Duration
 	// ClaudeStablePolls and ClaudeStableFor say when a claude.ai reply
 	// with no stop_reason counts as finished: the same text on this many
@@ -124,7 +112,13 @@ type WebAgent struct {
 	// (DefaultClaudeStablePolls and DefaultClaudeStableFor when zero).
 	ClaudeStablePolls int
 	ClaudeStableFor   time.Duration
-	Log               io.Writer
+	// PresenceInterval is how often the agent refreshes its relay presence
+	// while it handles a request (DefaultPresenceInterval when zero).
+	PresenceInterval time.Duration
+	Log              io.Writer
+
+	// clock paces the reply wait (the real clock when nil).
+	clock webClock
 
 	mu sync.Mutex
 }
@@ -152,6 +146,7 @@ func (w *WebAgent) handleSafely(ctx context.Context, req envelope.Request) {
 	}
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
+	defer w.keepPresence(hctx)()
 	defer func() {
 		if p := recover(); p != nil {
 			w.logf("request %s: panic: %v", req.ID, p)
@@ -288,7 +283,7 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 	label := siteLabel(w.Site)
 
 	// 1. Access, from relay-set fields only.
-	if reason := chainDenied(w.Allowlist, req, w.Name, "send messages to "+label+" as Matt", w.logf); reason != "" {
+	if reason := chainDenied(w.Allowlist, req, w.Name, "send messages to "+label+" as the owner", w.logf); reason != "" {
 		w.logf("request %s from %s (chain %v): declined: %s", req.ID, req.From, req.Chain, reason)
 		w.reply(ctx, req, reason, envelope.StatusDeclined, nil)
 		return
@@ -314,6 +309,13 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 		w.resume(ctx, req, wr, e)
 		return
 	}
+	// The site rate-limited the account a moment ago: it is not asked
+	// again until the cooldown ends.
+	if left := w.Native.CooldownRemaining(w.Site); left > 0 {
+		w.logf("request %s from %s: %s is rate-limited for another %s; not sending", req.ID, req.From, label, left.Round(time.Second))
+		w.reply(ctx, req, w.rateLimitReply(), envelope.StatusFailed, nil)
+		return
+	}
 	st := w.loadState()
 	convID, newChat, remembered := "", false, false
 	switch wr.mode {
@@ -326,7 +328,12 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 			convID, remembered = m.ID, true
 		}
 	}
-	anchor := w.anchorFor(ctx, convID, wr.message)
+	anchor, err := w.anchorFor(ctx, convID, wr.message)
+	if err != nil {
+		w.logf("request %s from %s: reading the conversation before the send: %v; not sending", req.ID, req.From, err)
+		w.reply(ctx, req, w.rateLimitReply(), envelope.StatusFailed, nil)
+		return
+	}
 	res, err := w.Native.Send(ctx, w.Site, wr.message, convID, newChat)
 	var note string
 	if remembered && errors.Is(err, ErrNotFound) {
@@ -385,6 +392,13 @@ func (w *WebAgent) answer(ctx context.Context, req envelope.Request, anchor repl
 		return
 	}
 	body, truncated := capReply(text)
+	if n := imageCount(conv); strings.TrimSpace(text) == "" && n > 0 {
+		what := "an image"
+		if n > 1 {
+			what = "images"
+		}
+		body = fmt.Sprintf("(%s replied with %s and no text)", label, what)
+	}
 	if truncated {
 		body += fmt.Sprintf("\n\n(reply truncated: showing %d of %d bytes)", len(body), len(text))
 	}
@@ -411,9 +425,15 @@ func capReply(s string) (string, bool) {
 	return capBytes(s, maxWebReplyBytes), true
 }
 
+// rateLimitReply is the answer while the site rate-limits the account.
+func (w *WebAgent) rateLimitReply() string { return rateLimitMessage(w.Site) + "." }
+
 func (w *WebAgent) sendFailure(err error, convID string) string {
 	label := siteLabel(w.Site)
 	var ue *UnavailableError
+	if _, ok := rateLimited(err); ok {
+		return w.rateLimitReply()
+	}
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return fmt.Sprintf("No %s conversation with id %s was found. Start a new one with \"new chat\" on the first line.", label, convID)
@@ -445,6 +465,11 @@ func (w *WebAgent) closeTab(ctx context.Context, convID string) {
 func (w *WebAgent) waitFailure(err error, convID string) string {
 	label := siteLabel(w.Site)
 	var ue *UnavailableError
+	if _, ok := rateLimited(err); ok {
+		// The message went through before the site started refusing reads:
+		// sending it again would duplicate it and add to the rate limit.
+		return fmt.Sprintf("Sorry, %s is rate-limiting this account right now. The message was sent to %s (conversation %s); ask for the reply later instead of sending it again.", label, label, convID)
+	}
 	switch {
 	case errors.Is(err, errOrphaned):
 		return fmt.Sprintf("Sorry, another message was sent in the %s conversation %s before this one was answered, so there is no reply to return.", label, convID)
@@ -477,11 +502,12 @@ type replyAnchor struct {
 
 // anchorFor reads the conversation's last user message before a send into
 // an existing conversation. When that read fails, prevUser stays empty and
-// the message is found by its text and time alone.
-func (w *WebAgent) anchorFor(ctx context.Context, convID, message string) replyAnchor {
+// the message is found by its text and time alone. A rate limit is
+// returned instead: sending now would only add to it.
+func (w *WebAgent) anchorFor(ctx context.Context, convID, message string) (replyAnchor, error) {
 	a := replyAnchor{message: message}
 	if convID == "" {
-		return a
+		return a, nil
 	}
 	raw, err := w.Native.Request(ctx, w.live().detailOp, OpArgs{ID: convID})
 	if err == nil {
@@ -493,13 +519,16 @@ func (w *WebAgent) anchorFor(ctx context.Context, convID, message string) replyA
 					break
 				}
 			}
-			return a
+			return a, nil
 		}
+	}
+	if _, ok := rateLimited(err); ok {
+		return a, err
 	}
 	if !errors.Is(err, ErrNotFound) {
 		w.logf("conversation %s: reading it before the send: %v", convID, err)
 	}
-	return a
+	return a, nil
 }
 
 // matches reports whether user message n can be the one this request
@@ -545,6 +574,13 @@ type webNode struct {
 	images int
 	// finished: the site marks this message finished.
 	finished bool
+	// hidden: the site does not show this message (ChatGPT's
+	// is_visually_hidden_from_conversation). It carries no reply text or
+	// images, but its endTurn still counts.
+	hidden bool
+	// endTurn: the site marks the whole turn over on this message
+	// (ChatGPT: end_turn true, or finish_details without end_turn false).
+	endTurn bool
 }
 
 // replyProgress is what one detail read says about the reply.
@@ -578,9 +614,12 @@ func (w *WebAgent) progress(raw json.RawMessage, a replyAnchor) (replyProgress, 
 }
 
 // progressOf finds this request's user message on the branch (a.bound, or
-// the first message after a.prevUser that a.matches) and its reply: the
-// last message after it and before the next user turn, when that is an
-// assistant answer.
+// the first message after a.prevUser that a.matches) and judges its turn:
+// every message after it and before the next user turn. The reply is the
+// turn's last visible answer text plus the images of its visible messages
+// (a generated image arrives in a tool message). The turn is finished when
+// any message in it, hidden or not, ends the turn, or when its last
+// visible message is a finished answer.
 func progressOf(nodes []webNode, a replyAnchor) replyProgress {
 	var p replyProgress
 	b := -1
@@ -616,25 +655,42 @@ func progressOf(nodes []webNode, a replyAnchor) replyProgress {
 			break
 		}
 	}
-	if end == b+1 {
+	var leaf, answer *webNode
+	images, ended := 0, false
+	for i := b + 1; i < end; i++ {
+		n := &nodes[i]
+		ended = ended || n.endTurn
+		if n.hidden {
+			continue
+		}
+		leaf = n
+		images += n.images
+		if n.reply && strings.TrimSpace(n.text) != "" {
+			answer = n
+		}
+	}
+	if leaf == nil && !ended {
 		p.orphaned = later
 		return p
 	}
-	leaf := nodes[end-1]
-	if !leaf.reply {
-		return p
+	var id, text string
+	if answer != nil {
+		id, text = answer.id, answer.text
 	}
-	p.found = strings.TrimSpace(leaf.text) != "" || leaf.images > 0
-	p.sig = fmt.Sprintf("%s\n%d\n%s", leaf.id, leaf.images, leaf.text)
-	p.finished = p.found && leaf.finished
+	p.found = text != "" || images > 0
+	p.sig = fmt.Sprintf("%s\n%d\n%s", id, images, text)
+	p.finished = ended || (p.found && leaf.reply && leaf.finished)
 	return p
 }
 
-// chatgptNodes reads the current_node branch. A user turn is a user
+// chatgptNodes reads the current_node branch. A user turn is a visible user
 // message with text or images (the ones parseChatGPTDetail makes turns
-// of); an answer is an assistant text message to everyone, finished when
-// its status is finished_successfully, finish_details is present, or
-// end_turn is true, and end_turn is not false.
+// of); an answer is a visible assistant text message to everyone,
+// finished when its status is finished_successfully, finish_details is
+// present, or end_turn is true, and end_turn is not false. Hidden
+// messages are kept for their end of turn: an image turn ends on a hidden,
+// empty assistant message with end_turn true, after a visible tool
+// message with the image and a reasoning recap with end_turn false.
 func chatgptNodes(raw json.RawMessage) ([]webNode, error) {
 	var d cgDetail
 	if err := json.Unmarshal(raw, &d); err != nil {
@@ -645,14 +701,17 @@ func chatgptNodes(raw json.RawMessage) ([]webNode, error) {
 	}
 	var out []webNode
 	for _, m := range d.path() {
-		if m.Metadata.Hidden {
-			continue
-		}
 		text, pointers := m.parts()
 		textual := m.Content.ContentType == "text" || m.Content.ContentType == "multimodal_text"
-		n := webNode{id: m.ID, text: text, at: m.CreateTime.Time, images: len(pointers)}
+		n := webNode{id: m.ID, text: text, at: m.CreateTime.Time, hidden: m.Metadata.Hidden}
+		if !n.hidden {
+			n.images = len(pointers)
+		}
 		switch m.Author.Role {
 		case "user":
+			if n.hidden {
+				continue
+			}
 			images := len(pointers)
 			for _, at := range m.Metadata.Attachments {
 				if strings.HasPrefix(at.MimeType, "image/") && validNativeID(at.ID) {
@@ -665,11 +724,12 @@ func chatgptNodes(raw json.RawMessage) ([]webNode, error) {
 			n.user = true
 		case "assistant":
 			// Reasoning and tool-call messages are not the answer.
-			n.reply = textual && (m.Recipient == "" || m.Recipient == "all")
+			n.reply = !n.hidden && textual && (m.Recipient == "" || m.Recipient == "all")
 			details := len(m.Metadata.FinishDetails) > 0 && string(m.Metadata.FinishDetails) != "null"
 			endTurn := m.EndTurn != nil && *m.EndTurn
 			notEnd := m.EndTurn != nil && !*m.EndTurn
 			n.finished = !notEnd && (m.Status == "finished_successfully" || details || endTurn)
+			n.endTurn = endTurn || (details && !notEnd)
 		}
 		out = append(out, n)
 	}
@@ -704,80 +764,6 @@ func claudeNodes(raw json.RawMessage) ([]webNode, error) {
 // in between.
 var errOrphaned = errors.New("another message was sent in the conversation before this one was answered")
 
-// waitReply reads the conversation every PollInterval until the reply to
-// this request's message is finished, and returns that read and the id of
-// this request's user message. A claude.ai reply without a stop_reason
-// counts as finished once the same reply is read on ClaudeStablePolls
-// consecutive polls spanning at least ClaudeStableFor. onBind, when set,
-// is called once with the user message id when it is first seen. Errors
-// that will not clear (logged out, the API changed, the extension gone)
-// end the wait at once, as does a later user turn with no reply to this
-// one; others are retried until ctx ends.
-func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, onBind func(string)) (json.RawMessage, string, error) {
-	every := w.PollInterval
-	if every <= 0 {
-		every = DefaultWebPollInterval
-	}
-	stablePolls := w.ClaudeStablePolls
-	if stablePolls <= 0 {
-		stablePolls = DefaultClaudeStablePolls
-	}
-	stableFor := w.ClaudeStableFor
-	if stableFor <= 0 {
-		stableFor = DefaultClaudeStableFor
-	}
-	op := w.live().detailOp
-	prev, seen := "", 0
-	var first time.Time
-	for {
-		raw, err := w.Native.Request(ctx, op, OpArgs{ID: convID})
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, a.bound, cerr
-		}
-		switch {
-		case err == nil:
-			p, perr := w.progress(raw, a)
-			if perr != nil {
-				return nil, a.bound, unavailable(w.Site, ErrEndpointChanged, "unexpected conversation shape")
-			}
-			if p.userID != "" && a.bound == "" {
-				a.bound = p.userID
-				if onBind != nil {
-					onBind(a.bound)
-				}
-			}
-			if p.orphaned {
-				return nil, a.bound, errOrphaned
-			}
-			if p.finished {
-				return raw, a.bound, nil
-			}
-			switch {
-			case !p.found || w.Site != SourceClaudeAI:
-				prev, seen = "", 0
-			case p.sig == prev:
-				seen++
-				if seen >= stablePolls && time.Since(first) >= stableFor {
-					return raw, a.bound, nil
-				}
-			default:
-				prev, seen, first = p.sig, 1, time.Now()
-			}
-		case errors.Is(err, ErrNotLoggedIn), errors.Is(err, ErrEndpointChanged), errors.Is(err, ErrExtensionNotConnected), errors.Is(err, ErrChromeNotRunning), errors.Is(err, ErrRejected):
-			return nil, a.bound, err
-		default:
-			w.logf("conversation %s: detail: %v (retrying)", convID, err)
-		}
-		t := time.NewTimer(every)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return nil, a.bound, ctx.Err()
-		case <-t.C:
-		}
-	}
-}
-
 // errReplyUnreadable: the finished read could not be turned into a reply.
 var errReplyUnreadable = errors.New("the reply could not be read")
 
@@ -809,16 +795,20 @@ func (w *WebAgent) readReply(ctx context.Context, convID, userID string, raw jso
 	return t.reply.Text, c, nil
 }
 
-// attachImages saves and uploads the reply's images and appends a line to
-// body saying what was actually attached.
-func (w *WebAgent) attachImages(ctx context.Context, req envelope.Request, conv []Conversation, body *string) []string {
+func imageCount(conv []Conversation) int {
 	n := 0
 	for _, c := range conv {
 		for _, m := range c.Messages {
 			n += len(m.Images)
 		}
 	}
-	if n == 0 {
+	return n
+}
+
+// attachImages saves and uploads the reply's images and appends a line to
+// body saying what was actually attached.
+func (w *WebAgent) attachImages(ctx context.Context, req envelope.Request, conv []Conversation, body *string) []string {
+	if imageCount(conv) == 0 {
 		return nil
 	}
 	base := w.TempDir
