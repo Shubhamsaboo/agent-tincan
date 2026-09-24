@@ -1,14 +1,26 @@
 // Agent Tincan history bridge: background service worker.
 //
 // Connects to the native host `tincan history native-host` and answers its
-// requests with the fixed operations in ops.js. An open native port keeps
-// the worker alive; if the host is missing or exits, an alarm retries.
+// requests with the fixed operations in ops.js (sends go through send.js).
+// On connect it says hello with its version and file hashes, so the host
+// can ask for a reload when the unpacked files on disk are newer. An open
+// native port keeps the worker alive; if the host is missing or exits, an
+// alarm retries.
 
-import { NATIVE_HOST, OpError, createRunner, validate } from './ops.js';
+import { NATIVE_HOST, OpError, createRunner, hashFiles, helloMessage, validate } from './ops.js';
+import { createSender } from './send.js';
 
 const RECONNECT_ALARM = 'tincan-reconnect';
-const runner = createRunner({ fetch: (url, init) => fetch(url, init) });
+const runner = createRunner({
+  fetch: (url, init) => fetch(url, init),
+  sender: createSender({ tabs: chrome.tabs, scripting: chrome.scripting }),
+  reload: () => chrome.runtime.reload(),
+});
 let port = null;
+// The files are hashed once, when this worker starts: every hello reports
+// the code Chrome loaded, not whatever is on disk at reconnect time, so
+// the host can tell when an update is waiting for a reload.
+const loadedFiles = hashFiles({ getURL: (f) => chrome.runtime.getURL(f), fetch: (url, init) => fetch(url, init) });
 
 function post(msg) {
   if (!port) return;
@@ -56,6 +68,12 @@ function connect() {
     void chrome.runtime.lastError;
     if (port === p) port = null;
   });
+  loadedFiles
+    .then((files) => helloMessage({ manifest: chrome.runtime.getManifest(), files }))
+    .then((m) => {
+      if (port === p) post(m);
+    })
+    .catch(() => {});
 }
 
 chrome.runtime.onStartup.addListener(connect);
