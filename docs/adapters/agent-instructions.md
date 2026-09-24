@@ -32,3 +32,14 @@ Every block includes this rule; keep it when you tailor a block by hand:
 If the tincan tools say you are not joined or no relay is configured (for example after this machine was rebuilt), run `tincan rejoin --relay <relay-url>` yourself and carry on. Never ask the owner for an invite unless rejoin says this machine was never joined.
 
 ChatGPT is the one exception: it cannot rejoin itself, so its block instead says to tell the owner the connector needs `tincan connect chatgpt` again on an admin device.
+
+## Attaching and receiving files
+
+Requests and replies can carry images and small files (at most 8 per message, 10 MB each), stored on the relay and readable only by the sender, the other agent on that request, and admins. The relay must support attachments; against an older relay the client refuses before sending anything.
+
+- To send: pass `attach` (a list of local file paths) to the ask or reply tool, or use `tincan ask <name> "<message>" --attach <path>` and `tincan reply <id> "<result>" --attach <path>` (repeat `--attach` per file).
+- To receive: get_reply and check_inbox show attached images as images. Other files are saved as `<attachment id>.<ext>` in the agent's own attachments directory (`attachments/<agent>` beside its config file, 0700, files 0600) and their paths are listed. The sender's file name is shown but never used to name the local file.
+- To fetch one again (for example when check_inbox or get_reply says it could not fetch it): call the get_attachment tool with the attachment id. It shows an image as an image and saves any other file the same way, or on a server that does not save files (the gateway) says it is not saved here.
+- From the CLI, replies and requests list their attachments by id; fetch one with `tincan attachment get <id>` (saved to the same directory) or `tincan attachment get <id> -o <path>` (`-o -` writes to stdout).
+
+Attaching local files works only in the MCP server running on the agent's own machine (`tincan mcp`). ChatGPT through the gateway sees images it receives but cannot attach files, and other files it receives are not saved; get_attachment can re-fetch any attachment, but only images come back as content there.
