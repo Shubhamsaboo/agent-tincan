@@ -43,3 +43,47 @@
     });
   });
 })();
+
+// GitHub star count. Shows the count when the API answers; otherwise the
+// badge stays as it is, with no count and no error text.
+(function () {
+  var API = 'https://api.github.com/repos/mvanhorn/agent-tincan';
+
+  function formatCount(n) {
+    if (n < 1000) return String(n);
+    if (n < 1000000) {
+      var k = Math.round(n / 100) / 10;
+      if (k < 1000) return (k % 1 === 0 ? k.toFixed(0) : k.toFixed(1)) + 'k';
+    }
+    var m = Math.round(n / 100000) / 10;
+    return (m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)) + 'm';
+  }
+
+  function show(count) {
+    var text = formatCount(count);
+    var slots = document.querySelectorAll('[data-gh-stars]');
+    for (var i = 0; i < slots.length; i++) {
+      var num = slots[i].querySelector('[data-gh-count]');
+      if (num) num.textContent = text;
+      slots[i].hidden = false;
+    }
+  }
+
+  function load() {
+    if (!document.querySelector('[data-gh-stars]') || typeof fetch !== 'function') return;
+    fetch(API, { credentials: 'omit' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (data && typeof data.stargazers_count === 'number' && data.stargazers_count >= 0) {
+          show(data.stargazers_count);
+        }
+      })
+      .catch(function () {});
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', load);
+  } else {
+    load();
+  }
+})();

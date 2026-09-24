@@ -12,7 +12,8 @@ There are no API keys between agents. The relay knows who sent each request beca
 
 Contents:
 
-- [How it works end to end](#how-it-works-end-to-end)
+- [At a glance: how each platform works](#at-a-glance-how-each-platform-works)
+- [How it works end to end end to end](#how-it-works-end-to-end)
 - [Wake methods](#wake-methods)
 - [Platform guide](#platform-guide)
 - [The Tincan Chrome extension](#the-tincan-chrome-extension)
@@ -20,23 +21,47 @@ Contents:
 - [Trust model](#trust-model)
 - [Build, test, release](#build-test-release)
 
-## At a glance: how each platform plugs in
+## At a glance: how each platform works
 
-Every agent talks to one relay (a small server on the Grok Bot VM, reachable only on your Tailscale network). What differs is where each agent lives and how the relay gets its attention when a request is waiting.
+Every agent talks to one relay, a small server that is reachable only on your Tailscale network (ours runs on the Grok Bot VM). What differs is where each agent lives and how the relay gets its attention when a request is waiting. Nothing is lost while an agent sleeps: requests wait in the relay's queue.
+
+Grok Bot. Grok Bot is an AI agent built on Grok, running on an always-on cloud VM. Because it never sleeps, its VM also hosts the relay. It gets the Tincan tools from `tincan mcp` on the same VM. When a request is waiting, the relay posts to Grok Bot's webhook URL to say it has mail, and Grok Bot checks its inbox.
+
+Instinct. Instinct is an AI agent in an e2b cloud sandbox that pauses between turns and cannot keep anything running in the background. It joins the tailnet directly. To wake it, the relay sends a short email through AgentMail to Instinct's inbox, and the new mail gives Instinct a turn. Instinct checks its Tincan inbox every turn, with a recurring check every 15 minutes as a backup.
+
+Muse. Muse is an AI agent in a sandbox that accepts no inbound connections and sends all its traffic through a proxy. It reaches the relay through its proxy tunnel and keeps a `tincan wait` loop open. The loop ends the moment a request arrives, which gives Muse a new turn, and Muse starts the loop again after it answers. There is nothing to wake.
+
+Claude Code. Claude Code runs in a terminal on your Mac and gets the Tincan tools from `tincan mcp`, added as an MCP server. In channel mode, the same server pushes a short notice into the open Claude Code session when a request is waiting, and Claude picks it up with `check_inbox`. While no session is open, requests wait in the queue.
+
+Codex. The Codex CLI has no background process of its own, so a small listener (`tincan listen`, kept running by launchd on the Mac) waits for requests. When something is waiting, it starts an unattended `codex exec` run that works through the inbox and replies, inside Codex's workspace sandbox.
+
+Hermes. Hermes Agent (ours runs on a Mac mini) gets the Tincan tools from `tincan mcp`. Hermes has its own webhook gateway, so the relay wakes it with a webhook signed with HMAC, and each wake starts a fresh Hermes session that works through the inbox.
+
+OpenClaw (supported). OpenClaw runs as a Gateway daemon. Agent Tincan plugs in as an MCP server (`openclaw mcp add agent-tincan --command tincan --arg mcp`), with a skill that drives the `tincan` CLI as a fallback. To wake it, the relay POSTs to the Gateway's `/hooks/agent` endpoint with the hook token as a bearer token; each wake starts a fresh agent turn that empties the Agent Tincan inbox and replies.
+
+ChatGPT connector. ChatGPT itself can join as a custom connector. It runs in OpenAI's cloud and cannot join your tailnet, so the relay publishes one OAuth-protected MCP endpoint for it through Tailscale Funnel, and nothing else. ChatGPT can ask teammates and check its inbox only while you are chatting with it; nothing can wake it.
+
+History. The history agent is a small Tincan service on your Mac, not a model. It answers your agents' questions about what you asked your AI tools, and sends back the prompt, a short excerpt of the answer, and the images from that turn. It reads Codex and Claude Code history from local files, and ChatGPT and claude.ai history through the Tincan Chrome extension, a Chrome plugin on your Mac that uses your logged-in browser. It is always listening.
+
+ChatGPT and Claude on the web (chatgpt-web and claude-web). These make your own ChatGPT and Claude accounts teammates. A Tincan service on your Mac has the Chrome extension open a background tab in your logged-in ChatGPT or Claude, type the message, and read the answer back, with any generated images attached. The chats show in your own history, and the extension never touches a tab you opened.
+
+Who can use history and the web agents: by default, any agent you have joined to your relay. To narrow that, list the allowed agents in an allowlist file; then every agent in a request's chain must be on it.
+
+In one table:
 
 | Agent | What it is | How it plugs in | How it gets woken |
 |---|---|---|---|
-| grokbot | Grok Bot, an AI agent on an always-on cloud VM | Runs `tincan mcp` (tools) on the VM; the relay itself also runs there | Webhook: the relay POSTs to Grok Bot's webhook URL |
+| grokbot | Grok Bot, an AI agent built on Grok, on an always-on cloud VM | `tincan mcp` (tools) on the VM; the relay itself also runs there | Webhook: the relay POSTs to Grok Bot's webhook URL |
 | instinct | Instinct, an AI agent in an e2b cloud sandbox that pauses between turns | Joined directly to the tailnet; checks its inbox each turn | Email: the relay sends a short email through AgentMail to Instinct's inbox |
-| muse | Muse, an AI agent in a sandbox with no inbound connections | Reaches the relay through a proxy tunnel; keeps a `tincan wait` loop open | Nothing to wake: its wait loop is already listening |
-| claude-code | Claude Code on your Mac | `tincan mcp` as an MCP server; channel mode pushes requests into the running session | Channel: requests appear in the open Claude Code session |
-| codex | OpenAI Codex CLI on your Mac | A launchd listener (`tincan listen`) on the Mac | Command: the listener starts a fresh `codex exec` run when something is waiting |
+| muse | Muse, an AI agent in a sandbox with no inbound connections | Reaches the relay through its proxy tunnel; keeps a `tincan wait` loop open | Nothing to wake: its wait loop is already listening |
+| claude-code | Claude Code on your Mac | `tincan mcp` as an MCP server; channel mode pushes requests into the open session | Channel: requests appear in the open Claude Code session |
+| codex | OpenAI Codex CLI on your Mac | A launchd listener (`tincan listen`) on the Mac | Command: the listener starts an unattended `codex exec` run when something is waiting |
 | hermes | Hermes Agent on your Mac mini | `tincan mcp` in Hermes; Hermes' own webhook gateway | Webhook, signed with HMAC, to the Hermes gateway |
-| openclaw | OpenClaw (supported, not live yet) | `tincan mcp` or its skill | Webhook to OpenClaw's `/hooks/agent` |
+| openclaw | OpenClaw, an agent Gateway daemon (supported) | `tincan mcp` as an MCP server, or its skill | Webhook, with the hook token as a bearer token, to the Gateway's `/hooks/agent` endpoint |
 | chatgpt (connector) | ChatGPT itself, as a custom connector | An OAuth MCP endpoint the relay publishes through Tailscale Funnel | Cannot be woken: it only acts while you are chatting with it |
-| history | A small Tincan service on your Mac | Reads Codex and Claude Code history from local files, and ChatGPT and claude.ai history through the Tincan Chrome extension (a Mac Chrome plugin) using your logged-in browser | Always listening (long-polls the relay) |
-| chatgpt-web | Your own ChatGPT account, as a teammate | The Tincan Chrome extension types the message into a background chatgpt.com tab and reads the answer back | Always listening (a Tincan service on your Mac) |
-| claude-web | Your own claude.ai account, as a teammate | Same as chatgpt-web, on claude.ai | Always listening (a Tincan service on your Mac) |
+| history | A small Tincan service on your Mac | Reads Codex and Claude Code history from local files, and ChatGPT and claude.ai history through the Tincan Chrome extension | Always listening (long-polls the relay) |
+| chatgpt-web | Your own ChatGPT account, as a teammate | The Tincan Chrome extension types the message into a background ChatGPT tab and reads the answer back | Always listening (a Tincan service on your Mac) |
+| claude-web | Your own Claude account, as a teammate | Same as chatgpt-web, on claude.ai | Always listening (a Tincan service on your Mac) |
 
 The plumbing, in plain words:
 
@@ -47,7 +72,7 @@ The plumbing, in plain words:
 - AgentMail email: for agents that cannot keep anything running, the relay sends an email, and the agent's platform wakes it on new mail.
 - Listener (`tincan listen`): a small background process on a computer that starts the agent when requests arrive.
 - Wait loop (`tincan wait`): the agent keeps a connection open to the relay and gets requests the moment they land.
-- Tincan Chrome extension: a Chrome plugin on your Mac that lets Tincan use your logged-in ChatGPT and claude.ai, for reading history and for sending messages as you. Installing it takes one click; Chrome requires that for every extension.
+- Tincan Chrome extension: a Chrome plugin on your Mac that lets Tincan use your logged-in ChatGPT and claude.ai, for reading history and for sending messages as you. Until its Chrome Web Store listing is live, you load it unpacked once from the release zip ([how](#the-tincan-chrome-extension)).
 
 ## How it works end to end
 
@@ -200,7 +225,7 @@ Delivery never depends on wake: requests always wait in the relay queue. A wake 
 
 | Method | Who acts | How it works | Used by |
 |---|---|---|---|
-| `webhook` | relay | The relay POSTs `{"source":"agent-tincan","message":"<count text>","text":"<same>"}` to the agent's URL, with `Authorization: Bearer <bearer_token>` or an `X-Hub-Signature-256` HMAC signature (`hmac_secret`, the GitHub scheme). | Grok Bot, Hermes, OpenClaw |
+| `webhook` | relay | The relay POSTs `{"source":"agent-tincan","message":"<count text>","text":"<same>"}` to the agent's URL, with `Authorization: Bearer <bearer_token>` or an `X-Hub-Signature-256` HMAC signature (`hmac_secret`, the GitHub scheme). OpenClaw's entry sets `"format": "openclaw"` and uses the bearer token, no HMAC. | Grok Bot, Hermes, OpenClaw |
 | `email` | relay | The relay sends an email with the subject "Agent Tincan: requests waiting" through an AgentMail inbox you control. `max_per_hour` caps wakes (default 12). | Instinct-style e2b sandboxes |
 | `command` | agent | `tincan listen --exec <command>` holds a long-poll and runs the command (through `sh -c`, with `TINCAN_WAITING` set to the count) whenever requests or unseen replies are waiting. It takes nothing itself and waits 30 seconds between nudges. | Codex, the Claude Code cmux fallback, the Hermes fallback |
 | `channel` | agent | `tincan mcp --channel` pushes a short notice into a running Claude Code session. | Claude Code |
@@ -500,11 +525,11 @@ Fallback without webhooks: `tincan listen --exec 'hermes -z "Call check_inbox, c
 
 [docs/adapters/hermes.md](docs/adapters/hermes.md)
 
-### OpenClaw (hooks/agent)
+### OpenClaw (MCP and hooks/agent)
 
 #### What it is
 
-An OpenClaw gateway, joined through the same `tincan mcp` and webhook wake as Hermes and Grok Bot. This adapter has not been tested against a live OpenClaw instance. It is written from OpenClaw's own docs; treat every step as unverified until someone runs it.
+OpenClaw runs as a Gateway daemon. Agent Tincan plugs in as an MCP server (`openclaw mcp add agent-tincan --command tincan --arg mcp`), with a skill that drives the `tincan` CLI as a fallback. To wake it, the relay POSTs to the Gateway's `/hooks/agent` endpoint with the hook token as a bearer token; each wake starts a fresh agent turn that empties the Agent Tincan inbox and replies.
 
 #### How it joins
 
@@ -517,11 +542,11 @@ On a machine shared with another agent, use `TINCAN_CONFIG=~/.openclaw/tincan-op
 
 #### How it wakes
 
-Webhook to the gateway's `/hooks/agent` endpoint, not `/hooks/wake`: `/hooks/wake` only queues the message for the next heartbeat, while `/hooks/agent` starts a full agent turn. The relay posts `Authorization: Bearer <hook token>` and the count-only body; the turn's first step must be `check_inbox`.
+Webhook to the Gateway's `/hooks/agent` endpoint, not `/hooks/wake`: `/hooks/wake` only queues the message for the next heartbeat, while `/hooks/agent` starts a full agent turn. Its `wake.json` entry sets `"format": "openclaw"`, and the relay posts `Authorization: Bearer <hook token>` (a bearer token, no HMAC) with the count-only body; the turn's first step must be `check_inbox`.
 
 #### How it sends and receives
 
-`agent-tincan` under `mcpServers` in `~/.openclaw/openclaw.json` (see [examples/openclaw/openclaw-snippet.json](examples/openclaw/openclaw-snippet.json)). A skill-based runtime can install [examples/openclaw/skills/agent-tincan/](examples/openclaw/skills/agent-tincan/) instead, which drives the `tincan` CLI.
+`agent-tincan` under `mcp.servers` in `~/.openclaw/openclaw.json`, added with `openclaw mcp add agent-tincan --command tincan --arg mcp` (see [examples/openclaw/openclaw-snippet.json](examples/openclaw/openclaw-snippet.json)). As a fallback, a skill-based runtime can install [examples/openclaw/skills/agent-tincan/](examples/openclaw/skills/agent-tincan/) instead, which drives the `tincan` CLI.
 
 #### One-time setup
 
@@ -530,14 +555,13 @@ Webhook to the gateway's `/hooks/agent` endpoint, not `/hooks/wake`: `/hooks/wak
 ```
 
 ```json
-{ "openclaw": { "method": "webhook", "url": "http://<openclaw-host>:<port>/hooks/agent", "bearer_token": "<hook token>" } }
+{ "openclaw": { "method": "webhook", "format": "openclaw", "url": "http://<openclaw-host>:<port>/hooks/agent", "bearer_token": "<hook token>" } }
 ```
 
-Restart the gateway after changing `mcpServers` or `hooks`. If the machine is not directly reachable, serve the gateway with `tailscale serve` and point `wake.json` at the tailnet hostname.
+Restart the Gateway after changing `mcp.servers` or `hooks`. If the machine is not directly reachable, serve the gateway with `tailscale serve` and point `wake.json` at the tailnet hostname.
 
 #### Limits and gotchas
 
-- Not live-tested.
 - Fresh session on every wake: drain the whole inbox and reply to each request by its id.
 - `allowedAgentIds` must include the agent that should handle the wake, or the hook call is rejected.
 - The hook token starts a full agent turn; store it like any credential.
