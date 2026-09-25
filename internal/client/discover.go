@@ -38,8 +38,8 @@ var findEvery = 30 * time.Second
 // relocate is called after a failed call. When the failure means nothing
 // answered at the relay's address and the client knows the relay key, it
 // asks the tailnet's online peers for the relay, and on finding it switches
-// to the new address, saves it to the config and reports true so the call
-// is retried once.
+// to the new address, saves it to the config file the client was built from
+// and reports true so the call is retried once.
 func (r *Relay) relocate(ctx context.Context, err error) bool {
 	if !unreachable(err) || ctx.Err() != nil {
 		return false
@@ -62,11 +62,11 @@ func (r *Relay) relocate(ctx context.Context, err error) bool {
 	r.base = found
 	r.baseMu.Unlock()
 	msg := fmt.Sprintf("tincan: the relay moved from %s to %s", old, found)
-	if r.persist {
-		if err := updateSavedRelay(old, found); err != nil {
-			msg += fmt.Sprintf("; could not update %s: %v", ConfigPath(), err)
+	if r.configFile != "" {
+		if err := updateSavedRelay(r.configFile, old, found); err != nil {
+			msg += fmt.Sprintf("; could not update %s: %v", r.configFile, err)
 		} else {
-			msg += "; updated " + ConfigPath()
+			msg += "; updated " + r.configFile
 		}
 	}
 	log.Print(msg)
@@ -236,10 +236,11 @@ func tailscaleBinary() string {
 	return ""
 }
 
-// updateSavedRelay rewrites the relay URL in the config file, but only
-// while it still says old, so a config someone changed meanwhile is kept.
-func updateSavedRelay(old, found string) error {
-	c, err := loadSavedConfig()
+// updateSavedRelay rewrites the relay URL in the config file at path, but
+// only while it still says old, so a config someone changed meanwhile is
+// kept.
+func updateSavedRelay(path, old, found string) error {
+	c, err := loadSavedConfig(path)
 	if err != nil {
 		return err
 	}
@@ -247,13 +248,14 @@ func updateSavedRelay(old, found string) error {
 		return nil
 	}
 	c.Relay = found
-	return SaveConfig(c)
+	return SaveConfigTo(path, c)
 }
 
-// loadSavedConfig reads the config file without environment overrides.
-func loadSavedConfig() (Config, error) {
+// loadSavedConfig reads the config file at path without environment
+// overrides.
+func loadSavedConfig(path string) (Config, error) {
 	var c Config
-	raw, err := os.ReadFile(ConfigPath())
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return c, err
 	}
@@ -269,27 +271,31 @@ func NeedsRelayInfo(c Config) bool {
 	return c.RelayKey == "" || time.Since(c.RelayInfoAt) > relayInfoEvery
 }
 
-// LearnRelayKey saves the relay key and the relay's advertised addresses
-// from whoami, so this client can find the relay again if its address
-// changes. It is quiet on failure: the information is only needed later.
-func LearnRelayKey(ctx context.Context, r *Relay) {
+// LearnRelayKey asks the relay (whoami) for its key and advertised
+// addresses, keeps them on r, and saves them to the config file r was built
+// from (NewRelayFor or NewRelayForFile), so this client can find the relay
+// again if its address changes. It reports whether the relay handed out a
+// key, whether or not it was saved. It is quiet on failure: the information
+// is only needed later.
+func LearnRelayKey(ctx context.Context, r *Relay) bool {
 	var out struct {
 		RelayKey  string   `json:"relay_key"`
 		RelayURLs []string `json:"relay_urls"`
 	}
 	if r.callOnce(ctx, r.api, "GET", "/v1/whoami", nil, &out) != nil || out.RelayKey == "" {
-		return
+		return false
 	}
 	r.findMu.Lock()
 	r.key, r.known = out.RelayKey, out.RelayURLs
 	r.findMu.Unlock()
-	if !r.persist {
-		return
+	if r.configFile == "" {
+		return true
 	}
-	c, err := loadSavedConfig()
+	c, err := loadSavedConfig(r.configFile)
 	if err != nil || strings.TrimRight(c.Relay, "/") != r.Base() {
-		return
+		return true
 	}
 	c.RelayKey, c.RelayURLs, c.RelayInfoAt = out.RelayKey, out.RelayURLs, time.Now().UTC()
-	_ = SaveConfig(c)
+	_ = SaveConfigTo(r.configFile, c)
+	return true
 }

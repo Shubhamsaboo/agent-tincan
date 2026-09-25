@@ -153,3 +153,132 @@ func TestLearnRelayInfoSavesURLsAndRefreshes(t *testing.T) {
 		t.Fatal("day-old relay info should be refreshed")
 	}
 }
+
+// LearnRelayKey says whether the relay handed out a key, so a caller can
+// tell "no key from the relay" from "key received but not saved".
+func TestLearnRelayKeyReportsWhetherKeyGiven(t *testing.T) {
+	savedConfig(t, Config{Relay: "http://unused"})
+	r, _ := NewRelayFor(Config{Relay: fakeRelay(t, "k")})
+	if !LearnRelayKey(t.Context(), r) {
+		t.Fatal("a relay that hands out its key should report true")
+	}
+	noKey := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": "muse"})
+	}))
+	t.Cleanup(noKey.Close)
+	r, _ = NewRelayFor(Config{Relay: noKey.URL})
+	if LearnRelayKey(t.Context(), r) {
+		t.Fatal("a relay without a key should report false")
+	}
+	r, _ = NewRelayFor(Config{Relay: deadURL(t)})
+	if LearnRelayKey(t.Context(), r) {
+		t.Fatal("an unreachable relay should report false")
+	}
+}
+
+// readConfig reads a config file as saved, with no environment overrides.
+func readConfig(t *testing.T, path string) Config {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c Config
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// A service loads its config from --config, not ConfigPath(). The key it
+// learns and the address of a moved relay go to that file, and the default
+// config (another agent's) is never touched.
+func TestNewRelayForFileWritesToItsOwnFile(t *testing.T) {
+	const key = "k-svc"
+	url := fakeRelay(t, key)
+	savedConfig(t, Config{Relay: url, Agent: "codex"}) // ConfigPath(): another agent
+	own := filepath.Join(t.TempDir(), "history.json")
+	if err := SaveConfigTo(own, Config{Relay: url, Agent: "history"}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewRelayForFile(Config{Relay: url, Agent: "history"}, own)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !LearnRelayKey(t.Context(), r) {
+		t.Fatal("no key learned")
+	}
+	if c := readConfig(t, own); c.RelayKey != key || c.Agent != "history" || len(c.RelayURLs) == 0 || c.RelayInfoAt.IsZero() {
+		t.Fatalf("own config %+v", c)
+	}
+	if c := readConfig(t, ConfigPath()); c.RelayKey != "" || c.Agent != "codex" {
+		t.Fatalf("ConfigPath() was written: %+v", c)
+	}
+
+	// The relay moves. Both files name the old address, so the old code
+	// (which always wrote ConfigPath()) would have rewritten the wrong one.
+	old := deadURL(t)
+	if err := SaveConfig(Config{Relay: old, Agent: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfigTo(own, Config{Relay: old, Agent: "history", RelayKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	r, _ = NewRelayForFile(Config{Relay: old, Agent: "history", RelayKey: key}, own)
+	r.findRelays = func(context.Context, string) []string { return []string{url} }
+	if _, err := r.Agents(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c := readConfig(t, own); c.Relay != url || c.RelayKey != key {
+		t.Fatalf("own config after the move %+v", c)
+	}
+	if c := readConfig(t, ConfigPath()); c.Relay != old {
+		t.Fatalf("ConfigPath() followed the move for another agent: %+v", c)
+	}
+}
+
+// TINCAN_RELAY overrides the saved relay for one process only: nothing is
+// written to any file, whichever constructor built the client.
+func TestEnvRelayOverrideNeverWrites(t *testing.T) {
+	const key = "k-env"
+	url := fakeRelay(t, key)
+	savedConfig(t, Config{Relay: url, Agent: "muse"})
+	own := filepath.Join(t.TempDir(), "history.json")
+	if err := SaveConfigTo(own, Config{Relay: url, Agent: "history"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TINCAN_RELAY", url)
+	for name, build := range map[string]func() (*Relay, error){
+		"NewRelayFor":     func() (*Relay, error) { return NewRelayFor(Config{Relay: url, Agent: "muse"}) },
+		"NewRelayForFile": func() (*Relay, error) { return NewRelayForFile(Config{Relay: url, Agent: "history"}, own) },
+	} {
+		r, err := build()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !LearnRelayKey(t.Context(), r) {
+			t.Fatalf("%s: the key is still handed out under TINCAN_RELAY", name)
+		}
+		if c := readConfig(t, ConfigPath()); c.RelayKey != "" {
+			t.Fatalf("%s: ConfigPath() written under TINCAN_RELAY: %+v", name, c)
+		}
+		if c := readConfig(t, own); c.RelayKey != "" {
+			t.Fatalf("%s: --config file written under TINCAN_RELAY: %+v", name, c)
+		}
+	}
+
+	// A move is followed in memory but not written either.
+	old := deadURL(t)
+	t.Setenv("TINCAN_RELAY", old)
+	if err := SaveConfigTo(own, Config{Relay: old, Agent: "history", RelayKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := NewRelayForFile(Config{Relay: old, Agent: "history", RelayKey: key}, own)
+	r.findRelays = func(context.Context, string) []string { return []string{url} }
+	if _, err := r.Agents(t.Context()); err != nil || r.Base() != url {
+		t.Fatalf("move: %v, base %s", err, r.Base())
+	}
+	if c := readConfig(t, own); c.Relay != old {
+		t.Fatalf("--config file rewritten under TINCAN_RELAY: %+v", c)
+	}
+}

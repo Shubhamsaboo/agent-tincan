@@ -34,6 +34,21 @@ func connect() (*client.Relay, client.Config, error) {
 	return r, cfg, err
 }
 
+// learnRelayInfo asks the relay for its key and addresses and saves them to
+// the config cfg was just written to, so the agent can find the relay again
+// if its address changes. join and rejoin call it right away rather than
+// leaving it to the next command, which a service agent (history serve, web
+// serve) never runs. Quiet on failure: the next connect tries again.
+func learnRelayInfo(ctx context.Context, cfg client.Config) {
+	r, err := client.NewRelayFor(cfg)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	client.LearnRelayKey(ctx, r)
+}
+
 func agentCmds() []*cobra.Command {
 	return []*cobra.Command{joinCmd(), inviteCmd(), kindCmd(), removeCmd(), agentsCmd(), askCmd(), getCmd(), inboxCmd(), replyCmd(), cancelCmd(), waitCmd()}
 }
@@ -78,6 +93,7 @@ func joinCmd() *cobra.Command {
 			if err := client.SaveConfig(cfg); err != nil {
 				return err
 			}
+			learnRelayInfo(cmd.Context(), cfg)
 			cmd.Printf("Joined as %q. Config saved to %s\n", name, client.ConfigPath())
 			return nil
 		},

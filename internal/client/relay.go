@@ -138,9 +138,11 @@ type Relay struct {
 	// key is the relay key from the saved config. When the relay stops
 	// answering at base, the client looks for the peer that proves it
 	// holds this key and moves there (see relocate).
-	key        string
-	known      []string // relay's advertised addresses, tried first
-	persist    bool     // save a found address to the config file
+	key   string
+	known []string // relay's advertised addresses, tried first
+	// configFile is the config file that relay info (LearnRelayKey) and a
+	// found address (relocate) are written back to; "" writes nothing.
+	configFile string
 	findMu     sync.Mutex
 	lastFind   time.Time
 	findRelays func(ctx context.Context, base string) []string // tests replace it
@@ -170,10 +172,20 @@ func NewRelay(base, proxy string) (*Relay, error) {
 	return &Relay{base: base, api: api, polls: polls, version: Version}, nil
 }
 
-// NewRelayFor returns a client for a saved config. It names the configured
-// agent on every call, so several agents on one machine (each with its own
-// TINCAN_CONFIG) are told apart.
+// NewRelayFor returns a client for the saved config at ConfigPath(). It
+// names the configured agent on every call, so several agents on one
+// machine (each with its own TINCAN_CONFIG) are told apart. What the client
+// learns about the relay (its key and addresses, a new address after a
+// move) is written back to that file.
 func NewRelayFor(c Config) (*Relay, error) {
+	return NewRelayForFile(c, ConfigPath())
+}
+
+// NewRelayForFile is NewRelayFor for a config loaded from path (a service's
+// --config), which is then the file relay info and a found address are
+// written back to. With TINCAN_RELAY set nothing is written to any file:
+// the environment overrides the saved relay for this process only.
+func NewRelayForFile(c Config, path string) (*Relay, error) {
 	r, err := NewRelay(c.Relay, c.Proxy)
 	if err != nil {
 		return nil, err
@@ -181,9 +193,9 @@ func NewRelayFor(c Config) (*Relay, error) {
 	r.agent = c.Agent
 	r.key = c.RelayKey
 	r.known = c.RelayURLs
-	// Only a relay URL that came from the config file is rewritten there;
-	// TINCAN_RELAY overrides it for this process only.
-	r.persist = os.Getenv("TINCAN_RELAY") == ""
+	if os.Getenv("TINCAN_RELAY") == "" {
+		r.configFile = path
+	}
 	return r, nil
 }
 
