@@ -37,8 +37,9 @@ export const ID_WAIT_MS = 60 * 1000;
 export const KEEP_TAB_MS = 10 * 60 * 1000;
 
 // SELECTORS is the one table of page selectors, tried in order. login and
-// loginPaths mean the page is logged out. stop, streaming, assistant and
-// user only help confirm that the page took the message; they are never
+// loginPaths mean the page is logged out. stop and streaming refuse a send
+// into a conversation that is still answering, and with assistant and user
+// they help confirm that the page took the message. None of them is ever
 // used to decide that a reply is finished.
 export const SELECTORS = Object.freeze({
   chatgpt: Object.freeze({
@@ -335,6 +336,12 @@ export function createSender({
     const tab = await tabs.create({ url: target, active: false });
     if (!tab || !Number.isSafeInteger(tab.id)) throw new OpError('send_failed', 'could not open a tab');
     owned.add(tab.id);
+    // urlId is the conversation id in the tab's address right now, '' when
+    // there is none.
+    const urlId = async () => {
+      const m = cfg.idFrom.exec((await tabURL(tab.id)).url);
+      return m ? m[1] : '';
+    };
     let done = false;
     try {
       // 1. Page load, then a composer (or a login page).
@@ -357,7 +364,13 @@ export function createSender({
         const m = cfg.idFrom.exec(page.href);
         if (!m || m[1] !== existing) throw new OpError('not_found', 'conversation not found');
       }
-      const base = page;
+      // A conversation still answering an earlier message will not take
+      // another (the site trades its send button for a stop button), and
+      // the answering itself would look like the page taking this one. So
+      // it is refused before anything is typed, and again right before the
+      // click, in case an answer started meanwhile.
+      const answering = () => new OpError('send_failed', 'the conversation is still answering an earlier message');
+      if (page.generating) throw answering();
 
       // 2. Fill and verify.
       const fill = await inject(tab.id, pageFill, [sel, args.message]);
@@ -367,10 +380,21 @@ export function createSender({
       }
 
       // 3. Send: retry while the button is disabled, then confirm the page
-      // took the message. A new chat's URL gaining an id also confirms it.
+      // took the message. The page is probed right before each click, so
+      // the confirmation compares with the page as it was then, not as it
+      // was when the tab opened. An existing conversation's address is
+      // checked then too: a deleted conversation shows its composer first
+      // and redirects a moment later, and the message must not go into
+      // whatever page is there by then. A new chat's URL gaining an id
+      // also confirms the send.
       const confirmBy = Math.min(deadline, now() + sendConfirmMs);
       let submittedAt;
+      let base;
       for (;;) {
+        if (existing && (await urlId()) !== existing) throw new OpError('not_found', 'conversation not found');
+        base = cleanProbe(await inject(tab.id, pageProbe, [sel]));
+        if (base.loggedOut) throw new OpError('not_logged_in', 'logged out while sending');
+        if (base.generating) throw answering();
         submittedAt = now();
         const r = await inject(tab.id, pageSubmit, [sel]);
         if (r && r.ok === true) break;
@@ -378,32 +402,25 @@ export function createSender({
         if (now() >= confirmBy) throw new OpError('send_failed', 'the send button stayed disabled');
         await sleep(pollMs);
       }
-      let id = existing;
       for (;;) {
         await sleep(pollMs);
-        if (!existing) {
-          const m = cfg.idFrom.exec((await tabURL(tab.id)).url);
-          if (m) {
-            id = m[1];
-            break;
-          }
-        }
+        if (!existing && (await urlId())) break;
         const p = cleanProbe(await inject(tab.id, pageProbe, [sel]));
         if (p.loggedOut) throw new OpError('not_logged_in', 'logged out while sending');
         if (p.userCount > base.userCount || p.generating || p.assistantCount > base.assistantCount) break;
         if (now() >= confirmBy) throw new OpError('send_failed', 'the page did not take the message');
       }
 
-      // 4. A new chat's id, from the tab URL. Nothing waits for the reply.
+      // 4. The conversation id, from the tab URL as it is now: a new chat's
+      // once it appears, or wherever the site put the message if it moved
+      // an existing conversation after the click. Nothing waits for the
+      // reply.
+      let id = await urlId();
       const idBy = Math.min(deadline, now() + idWaitMs);
       while (!id) {
-        const m = cfg.idFrom.exec((await tabURL(tab.id)).url);
-        if (m) {
-          id = m[1];
-          break;
-        }
         if (now() >= idBy) throw new OpError('timeout', 'the message was sent but no conversation id appeared in time');
         await sleep(pollMs);
+        id = await urlId();
       }
       done = true;
       keep(tab.id, site, id);

@@ -399,8 +399,12 @@ export function createRunner({ fetch, sender = null, reload = null }) {
       await chatgptAuth();
       return sender.send('chatgpt', a);
     },
+    // The read operations keep the organization id cached, so the send
+    // drops it and asks claude.ai again: a browser that logged out since
+    // the last read must not get a tab.
     async 'claudeai.send'(a) {
       if (!sender) throw new OpError('unsupported', 'this extension build cannot send');
+      claudeOrg = null;
       await claudeOrgId();
       return sender.send('claudeai', a);
     },

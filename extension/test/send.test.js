@@ -79,7 +79,9 @@ class FakeSite {
     this.messages = [];
     const m = /\/(?:c|chat)\/([A-Za-z0-9_-]+)/.exec(this.href);
     if (m) this.messages.push({ role: 'user', text: 'earlier question' }, { role: 'assistant', text: 'old answer' });
-    this.generating = false;
+    // answering: the page is still writing an answer when it loads.
+    this.generating = Boolean(this.opts.answering);
+    this.ticks = 0;
     this.submitted = [];
     this.doc = this.makeDoc();
     this.composer = new El(this, this.opts.textarea ? 'TEXTAREA' : 'DIV');
@@ -105,6 +107,8 @@ class FakeSite {
         if (!this.opts.noComposer) els.push(this.composer);
         break;
       case 'send':
+        // sendReadyTick: the button stays disabled until that tick.
+        if (this.opts.sendReadyTick) this.sendBtn.disabled = this.ticks < this.opts.sendReadyTick;
         if (!this.opts.noSendButton) els.push(this.sendBtn);
         break;
       case 'stop':
@@ -139,7 +143,12 @@ class FakeSite {
         if (!page.opts.execWorks || page.opts.readOnly) return false;
         const t = this.activeElement;
         if (t !== page.composer) return false;
-        if (cmd === 'insertText') t.text += val;
+        if (cmd === 'insertText') {
+          t.text += val;
+          // answerOnFill: an answer to an earlier message starts while
+          // the text is typed.
+          if (page.opts.answerOnFill) page.generating = true;
+        }
         if (cmd === 'delete') t.text = '';
         return true;
       },
@@ -156,7 +165,11 @@ class FakeSite {
     this.streamLeft = this.opts.streamTicks;
   }
   tick() {
+    this.ticks++;
     if (this.loadLeft > 0) this.loadLeft--;
+    // moveAtTick/moveTo: the site changes the address at that tick (a
+    // deleted conversation redirecting, or a fork).
+    if (this.opts.moveTo && this.ticks === this.opts.moveAtTick) this.href = this.opts.moveTo;
     if (!this.generating) return;
     this.ticksSinceSubmit = (this.ticksSinceSubmit || 0) + 1;
     if (!/\/(?:c|chat)\//.test(this.href) && !this.opts.noId && this.ticksSinceSubmit > (this.opts.idDelayTicks || 0)) {
@@ -428,6 +441,44 @@ test('a conversation id that the site redirects away from is not_found, and noth
   assert.deepEqual(page.submitted, []);
 });
 
+test('a conversation still answering an earlier message is send_failed, nothing typed', async () => {
+  // Still answering when the tab opens: refused before the fill, even
+  // though the page ignores clicks and keeps showing a stop button, which
+  // used to pass for the page taking the message.
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { answering: true, neverFinish: true, ignoreSubmit: true })));
+  await assert.rejects(sender(fc).send('chatgpt', { message: 'x', conversation_id: 'abc-123' }), (e) => e.code === 'send_failed' && /still answering/.test(e.message));
+  assert.equal(fc.log.scripts.filter((s) => s.func === pageFill).length, 0, 'nothing typed');
+  assert.deepEqual(page.submitted, []);
+  assert.deepEqual(fc.log.removed, [100]);
+
+  // An answer that starts between the fill and the click: refused right
+  // before the click, so the answering is not taken for this send.
+  const fc2 = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { answerOnFill: true, neverFinish: true, ignoreSubmit: true })));
+  await assert.rejects(sender(fc2).send('chatgpt', { message: 'x', conversation_id: 'abc-123' }), (e) => e.code === 'send_failed' && /still answering/.test(e.message));
+  assert.equal(fc2.log.scripts.filter((s) => s.func === pageSubmit).length, 0, 'never clicked');
+  assert.deepEqual(page.submitted, []);
+  assert.deepEqual(fc2.log.removed, [100]);
+});
+
+test('an existing conversation the site moves away from: not_found before the click, the new address after it', async () => {
+  // A deleted conversation shows its composer, then redirects to / while
+  // the send button is still disabled. Nothing is sent.
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { sendReadyTick: 2, moveAtTick: 2, moveTo: 'https://chatgpt.com/' })));
+  await assert.rejects(sender(fc).send('chatgpt', { message: 'x', conversation_id: 'gone-1' }), (e) => e.code === 'not_found');
+  assert.deepEqual(page.submitted, []);
+  assert.deepEqual(fc.log.removed, [100]);
+
+  // The site moves the conversation once the message is in (a fork): the
+  // send reports where the message went, not the id it was asked for.
+  const fc2 = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { moveAtTick: 2, moveTo: 'https://chatgpt.com/c/forked-2', neverFinish: true })));
+  const r = await sender(fc2).send('chatgpt', { message: 'x', conversation_id: 'abc-123' });
+  assert.deepEqual(page.submitted, ['x']);
+  assert.equal(r.conversation_id, 'forked-2');
+  assert.equal(r.url, 'https://chatgpt.com/c/forked-2');
+});
+
 test('the message is data: script-looking text is typed verbatim and never run', async () => {
   let ran = false;
   globalThis.__tincanPwned = () => {
@@ -484,6 +535,18 @@ test('runner: claudeai.send needs an organization; without a sender send is unsu
   assert.equal(fc.log.created.length, 0);
   const none = createRunner({ fetch: async () => jsonResponse({ accessToken: 't' }) });
   await assert.rejects(none.run('chatgpt.send', { message: 'x' }, () => {}), (e) => e.code === 'unsupported');
+});
+
+test('runner: claudeai.send checks the session fresh, not from the organization a read cached', async () => {
+  const fc = fakeChrome((url) => new FakeSite('claudeai', url, { loggedOut: true }));
+  const calls = [];
+  let orgs = [{ uuid: 'org-1', capabilities: ['chat'] }];
+  const r = createRunner({ fetch: async (u) => (calls.push(String(u)), jsonResponse(orgs)), sender: sender(fc) });
+  await r.run('claudeai.list', { count: 1 }, () => {});
+  orgs = []; // logged out since that read
+  await assert.rejects(r.run('claudeai.send', { message: 'x' }, () => {}), (e) => e.code === 'not_logged_in');
+  assert.equal(calls.filter((u) => u.endsWith('/api/organizations')).length, 2, 'asked claude.ai again for the send');
+  assert.equal(fc.log.created.length, 0, 'no tab while logged out');
 });
 
 test('runner: chatgpt.close and claudeai.close close only the tab a send left open', async () => {
