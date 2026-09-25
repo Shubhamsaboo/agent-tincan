@@ -31,7 +31,7 @@ TS_AUTHKEY=tskey-auth-... tincan relay --admin my-laptop
 ```
 
 - It joins your tailnet as `tincan-relay`, so agents reach it at `http://tincan-relay`.
-- `--admin` lists the machine names (as shown by `tailscale status`) allowed to invite and remove agents. On the relay host you can always use the local admin socket instead: `tincan invite muse --socket <state-dir>/admin.sock`. The path is printed at startup. The default state dir is `~/.config/tincan-relay` on Linux and `~/Library/Application Support/tincan-relay` on macOS, which has a space, so quote it: `--socket "$HOME/Library/Application Support/tincan-relay/admin.sock"`.
+- `--admin` lists the machine names (as shown by `tailscale status`) allowed to invite and remove agents. The relay host is always an admin with no flags: `tincan invite muse` there uses its local admin socket. Pass `--socket <state-dir>/admin.sock` only when the relay runs with a non-default `--state-dir` (the path is printed at startup; on macOS the default dir has a space, so quote it).
 - A machine is an admin only if its name is in `--admin` and it has no Tailscale tags. Tag your agent machines (for example `tag:agent`, via `tailscale up --advertise-tags=tag:agent` or an auth key with that tag) so they can never be admins, even if one is renamed to match an admin machine.
 - `--admin-login you@example.com` additionally requires an admin machine to be owned by that Tailscale login. It narrows admin rights on shared tailnets, but on a single-user tailnet every node has the same owner, so the machine list and tags still do the real work.
 - If the host already runs tailscaled and you would rather not add a node, use `--listen 100.x.y.z --port 8787` with the host's tailnet IP. The default is better: its own node keeps a stable name and IP even when the host re-joins Tailscale. Back up the state dir either way.
@@ -54,7 +54,7 @@ tincan join ABCD-EFGH --relay http://tincan-relay
 
 Repeat for muse (`tincan invite muse --relay http://tincan-relay` on the admin device, then `tincan join <code> --relay http://tincan-relay` on muse's machine).
 
-Check with `tincan agents`. An admin device never joins, so it has no saved relay: pass it with `tincan agents --relay http://tincan-relay` (or set `TINCAN_RELAY=http://tincan-relay`), or use `--socket` on the relay host. A joined agent just runs `tincan agents`. It also shows when each agent last called the relay, by polling or by any send, reply, or get ("last seen 12m ago", or "never seen"), and which tincan build each last called with, next to the relay's own, so an agent that needs `tincan upgrade` stands out.
+Check with `tincan agents`. An admin device never joins, so it has no saved relay: pass it with `tincan agents --relay http://tincan-relay` (or set `TINCAN_RELAY=http://tincan-relay`), or run it on the relay host, where it needs no flags. A joined agent just runs `tincan agents`. It also shows when each agent last called the relay, by polling or by any send, reply, or get ("last seen 12m ago", or "never seen"), and which tincan build each last called with, next to the relay's own, so an agent that needs `tincan upgrade` stands out.
 
 ## Rebuilt machines
 

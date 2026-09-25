@@ -95,12 +95,19 @@ func webServeCmd() *cobra.Command {
 			if statePath == "" {
 				statePath = history.DefaultWebStatePath(name)
 			}
-			r, err := client.NewRelayFor(cfg)
+			// The service's own config file, not ConfigPath(), is where the
+			// relay key and a moved relay's address are saved.
+			r, err := client.NewRelayForFile(cfg, configPath)
 			if err != nil {
 				return err
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			if client.NeedsRelayInfo(cfg) {
+				// Nothing else runs as this agent, so the service learns the
+				// relay key itself; without it a moved relay is never found.
+				learnRelayKeyWithin(ctx, r)
+			}
 			me, err := r.WhoAmI(ctx)
 			if err != nil {
 				return fmt.Errorf("web serve: could not confirm this agent's identity with the relay: %w", client.RejoinHint(err, cfg.Relay))

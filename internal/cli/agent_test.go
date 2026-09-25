@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -163,5 +164,33 @@ func TestFormatRosterNamesRelayVersion(t *testing.T) {
 	}
 	if got := formatRoster(client.Roster{Agents: agents}, now); got != formatAgents(agents, now) {
 		t.Fatalf("roster without a relay version =\n%s", got)
+	}
+}
+
+// tincan join saves the relay key and addresses at once, not on the next
+// command: a service agent (history serve, web serve) never runs one.
+func TestJoinSavesRelayKey(t *testing.T) {
+	m := testrelay.New(t, relay.Config{})
+	m.Server.SetURLs([]string{"http://tincan-relay"})
+	useConfig(t, client.Config{})
+	if _, err := run(t, joinCmd(), m.Invite(t, "hermes"), "--relay", m.URL("stranger")); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil || cfg.Agent != "hermes" {
+		t.Fatalf("config = %+v, %v", cfg, err)
+	}
+	if cfg.RelayKey == "" || cfg.RelayInfoAt.IsZero() || !slices.Equal(cfg.RelayURLs, []string{"http://tincan-relay"}) {
+		t.Fatalf("join left the relay info out: %+v", cfg)
+	}
+	r, err := client.NewRelayFor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw struct {
+		RelayKey string `json:"relay_key"`
+	}
+	if err := r.Raw(context.Background(), "GET", "/v1/whoami", nil, &raw); err != nil || raw.RelayKey != cfg.RelayKey {
+		t.Fatalf("saved key %q, relay's %q, %v", cfg.RelayKey, raw.RelayKey, err)
 	}
 }

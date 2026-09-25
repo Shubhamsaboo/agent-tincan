@@ -70,15 +70,18 @@ func LoadConfigFrom(path string) (Config, error) {
 	return c, nil
 }
 
-// SaveConfig writes the config with owner-only permissions.
-func SaveConfig(c Config) error {
-	p := ConfigPath()
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+// SaveConfig writes the config to ConfigPath() with owner-only permissions.
+func SaveConfig(c Config) error { return SaveConfigTo(ConfigPath(), c) }
+
+// SaveConfigTo writes the config to path with owner-only permissions,
+// creating the directory as needed.
+func SaveConfigTo(path string, c Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writePrivate(p, raw)
+	return writePrivate(path, raw)
 }

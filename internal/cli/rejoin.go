@@ -22,14 +22,15 @@ a new Tailscale node. When it keeps its machine name and owner, and its old
 node is offline or gone, the relay re-admits it as the same agent on the
 first call. rejoin makes that call, confirms who the relay says this machine
 is, and saves the relay, proxy, and agent name to the config (TINCAN_CONFIG
-when set).
+when set), along with the relay's key and addresses so the agent can find
+the relay again if its address changes.
 
 Only a machine that was never joined needs a first-time invite from an admin.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, _ := client.LoadConfig()
 			if relayURL != "" {
-				cfg.Relay = relayURL
+				setRelay(&cfg, relayURL)
 			}
 			if cmd.Flags().Changed("proxy") {
 				cfg.Proxy = proxy
@@ -52,6 +53,7 @@ Only a machine that was never joined needs a first-time invite from an admin.`,
 			if err := client.SaveConfig(cfg); err != nil {
 				return err
 			}
+			learnRelayInfo(cmd.Context(), cfg)
 			kind := ""
 			if me.Kind != "" {
 				kind = " (kind " + me.Kind + ")"

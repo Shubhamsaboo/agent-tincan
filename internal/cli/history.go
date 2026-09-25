@@ -256,7 +256,9 @@ func historyServeCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("history allowlist: %w", err)
 			}
-			r, err := client.NewRelayFor(cfg)
+			// The service's own config file, not ConfigPath(), is where the
+			// relay key and a moved relay's address are saved.
+			r, err := client.NewRelayForFile(cfg, configPath)
 			if err != nil {
 				return err
 			}
@@ -279,6 +281,11 @@ func historyServeCmd() *cobra.Command {
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			if client.NeedsRelayInfo(cfg) {
+				// Nothing else runs as this agent, so the service learns the
+				// relay key itself; without it a moved relay is never found.
+				learnRelayKeyWithin(ctx, r)
+			}
 			// The relay, not the config file, says who this machine is. Serving
 			// as any other agent would poll and claim that agent's inbox.
 			me, err := r.WhoAmI(ctx)

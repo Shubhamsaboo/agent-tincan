@@ -34,6 +34,38 @@ func connect() (*client.Relay, client.Config, error) {
 	return r, cfg, err
 }
 
+// learnRelayInfo asks the relay for its key and addresses and saves them to
+// the config cfg was just written to, so the agent can find the relay again
+// if its address changes. join and rejoin call it right away rather than
+// leaving it to the next command, which a service agent (history serve, web
+// serve) never runs. Quiet on failure: the next connect tries again.
+func learnRelayInfo(ctx context.Context, cfg client.Config) {
+	r, err := client.NewRelayFor(cfg)
+	if err != nil {
+		return
+	}
+	learnRelayKeyWithin(ctx, r)
+}
+
+// learnRelayKeyWithin is client.LearnRelayKey with the same 5-second bound
+// connect uses, so a relay that accepts the connection but never answers
+// cannot hold up join, rejoin or a service's startup.
+func learnRelayKeyWithin(ctx context.Context, r *client.Relay) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	client.LearnRelayKey(ctx, r)
+}
+
+// setRelay points cfg at url. The relay key and addresses belong to the old
+// relay, so a different url drops them: if learnRelayInfo then fails, the
+// config must not pair the new address with the old relay's key.
+func setRelay(cfg *client.Config, url string) {
+	if strings.TrimRight(url, "/") != strings.TrimRight(cfg.Relay, "/") {
+		cfg.RelayKey, cfg.RelayURLs, cfg.RelayInfoAt = "", nil, time.Time{}
+	}
+	cfg.Relay = url
+}
+
 func agentCmds() []*cobra.Command {
 	return []*cobra.Command{joinCmd(), inviteCmd(), kindCmd(), removeCmd(), agentsCmd(), askCmd(), getCmd(), inboxCmd(), replyCmd(), cancelCmd(), waitCmd()}
 }
@@ -48,7 +80,7 @@ func joinCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _ := client.LoadConfig()
 			if relayURL != "" {
-				cfg.Relay = relayURL
+				setRelay(&cfg, relayURL)
 			}
 			if cmd.Flags().Changed("proxy") {
 				cfg.Proxy = proxy
@@ -78,6 +110,7 @@ func joinCmd() *cobra.Command {
 			if err := client.SaveConfig(cfg); err != nil {
 				return err
 			}
+			learnRelayInfo(cmd.Context(), cfg)
 			cmd.Printf("Joined as %q. Config saved to %s\n", name, client.ConfigPath())
 			return nil
 		},

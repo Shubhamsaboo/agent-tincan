@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/history"
 )
 
@@ -370,5 +371,57 @@ func TestServeStartupLineDescribesAllowlist(t *testing.T) {
 				t.Errorf("%s with %s: output missing %q:\n%s", c.name, filepath.Base(allow), want, out)
 			}
 		}
+	}
+}
+
+// A service is the only thing that ever runs as its agent, so it learns the
+// relay key itself, into its own --config file. The default config
+// (TINCAN_CONFIG, another agent's) is never written.
+func TestServeLearnsRelayKeyIntoItsOwnConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"history", []string{"history", "serve"}},
+		{"chatgpt-web", []string{"web", "serve", "--site", "chatgpt"}},
+		{"claude-web", []string{"web", "serve", "--site", "claude-ai"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			other := filepath.Join(t.TempDir(), "client.json")
+			t.Setenv("TINCAN_CONFIG", other)
+			t.Setenv("TINCAN_RELAY", "")
+			t.Setenv("TINCAN_PROXY", "")
+			// history serve checks the native-host manifest and web serve keeps
+			// its state under HOME, so neither touches the real one.
+			t.Setenv("HOME", t.TempDir())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/whoami" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"name": c.name, "relay_key": "k-" + c.name, "relay_urls": []string{"http://tincan-relay"}})
+					return
+				}
+				cancel()
+				http.Error(w, "stopping", http.StatusServiceUnavailable)
+			}))
+			t.Cleanup(srv.Close)
+			own := serveConfig(t, srv.URL, c.name)
+			cmd := Root()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(append(slices.Clone(c.args), "--config", own, "--allowlist", filepath.Join(t.TempDir(), "allow.txt")))
+			if err := cmd.ExecuteContext(ctx); err != nil {
+				t.Fatalf("%v: %v\n%s", c.args, err, out.String())
+			}
+			cfg, err := client.LoadConfigFrom(own)
+			if err != nil || cfg.Agent != c.name || cfg.RelayKey != "k-"+c.name || !slices.Equal(cfg.RelayURLs, []string{"http://tincan-relay"}) || cfg.RelayInfoAt.IsZero() {
+				t.Fatalf("own config after serve = %+v, %v", cfg, err)
+			}
+			if _, err := os.Stat(other); !os.IsNotExist(err) {
+				t.Fatalf("the default config was written: %v", err)
+			}
+		})
 	}
 }
