@@ -2,6 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +47,29 @@ other: true
 	}
 	if es[1].Name != "old tincan" || es[1].Command != "/usr/local/bin/tincan" || strings.Join(es[1].Args, " ") != "mcp --channel" || !es[1].broken {
 		t.Fatalf("second entry %+v, want the block-list args and disabled", es[1])
+	}
+}
+
+// Keys in a sub-block under a server (env here) belong to that block, so
+// an enabled: false there does not disable the server. A comment after
+// mcp_servers: does not hide the block.
+func TestYamlServersNestedKeysAndComments(t *testing.T) {
+	es := yamlServers(`
+mcp_servers:   # MCP servers
+  agent-tincan:
+    command: tincan
+    env:
+      enabled: false
+      command: other
+      args: [x]
+    args:
+      - mcp
+`)
+	if len(es) != 1 {
+		t.Fatalf("got %d entries %+v, want the tincan server", len(es), es)
+	}
+	if es[0].Command != "tincan" || strings.Join(es[0].Args, " ") != "mcp" || es[0].broken {
+		t.Fatalf("entry %+v, want tincan mcp and not disabled", es[0])
 	}
 }
 
@@ -92,8 +118,13 @@ func TestConfigDuplicatesCountPerScope(t *testing.T) {
 	if err := os.WriteFile(userAndProject, []byte(`{"mcpServers":{"tincan":`+entry+`},"projects":{"/a":{"mcpServers":{"agent-tincan":`+entry+`}}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// OpenClaw keeps its servers at mcp.servers, a map it loads everywhere.
+	openclaw := filepath.Join(dir, "openclaw.json")
+	if err := os.WriteFile(openclaw, []byte(`{"mcp":{"servers":{"tincan":`+entry+`}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	byFile := map[string][]mcpConfigEntry{}
-	for _, e := range findMCPConfigs([]string{twoProjects, userAndProject}) {
+	for _, e := range findMCPConfigs([]string{twoProjects, userAndProject, openclaw}) {
 		byFile[e.File] = append(byFile[e.File], e)
 	}
 	es := byFile[twoProjects]
@@ -110,6 +141,10 @@ func TestConfigDuplicatesCountPerScope(t *testing.T) {
 	es = byFile[userAndProject]
 	if len(es) != 2 || !es[0].broken || !es[1].broken || !strings.Contains(strings.Join(es[0].Problems, " "), "one of 2") {
 		t.Fatalf("user plus project entries judged: %+v", es)
+	}
+	es = byFile[openclaw]
+	if len(es) != 1 || es[0].Scope != "" || es[0].broken {
+		t.Fatalf("openclaw entry judged: %+v", es)
 	}
 }
 
@@ -140,5 +175,63 @@ func TestDoctorRelayMovesUnderTincanRelayOverride(t *testing.T) {
 	c := relayMoves()
 	if c.Status != "warn" || !strings.Contains(c.Detail, "TINCAN_RELAY") || strings.Contains(c.Detail, "older than") || !strings.Contains(c.Fix, "rejoin") {
 		t.Fatalf("under TINCAN_RELAY: %+v", c)
+	}
+}
+
+// The other two reasons a relay key is missing: a relay too old to hand it
+// out, and a config file the key could not be written to.
+func TestDoctorRelayMovesOldRelayAndSaveFailure(t *testing.T) {
+	m := testrelay.New(t, relay.Config{})
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	relayMoves := func() check {
+		t.Helper()
+		for _, c := range runDoctor(context.Background(), "", nil).Checks {
+			if c.Name == "relay moves" {
+				return c
+			}
+		}
+		t.Fatal("no relay moves check")
+		return check{}
+	}
+
+	// A relay older than 0.5.0-rc12 leaves relay_key out of whoami.
+	h := m.Server.Handler()
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.RemoteAddr = "100.0.0.2:1" // grokbot's machine
+		if r.URL.Path != "/v1/whoami" {
+			h.ServeHTTP(w, r)
+			return
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Error(err)
+		}
+		delete(body, "relay_key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(rec.Code)
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	t.Cleanup(old.Close)
+	useConfig(t, client.Config{Relay: old.URL, Agent: "grokbot"})
+	if c := relayMoves(); c.Status != "warn" || !strings.Contains(c.Detail, "older than") {
+		t.Fatalf("old relay: %+v", c)
+	}
+
+	// A current relay, but the config directory is read-only.
+	if os.Getuid() == 0 {
+		t.Skip("root writes to read-only directories")
+	}
+	useConfig(t, client.Config{Relay: m.URL("grokbot"), Agent: "grokbot"})
+	dir := filepath.Dir(client.ConfigPath())
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if c := relayMoves(); c.Status != "warn" || !strings.Contains(c.Detail, "could not be saved") || strings.Contains(c.Detail, "older than") {
+		t.Fatalf("read-only config: %+v", c)
 	}
 }

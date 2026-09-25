@@ -115,8 +115,9 @@ func findMCPConfigs(extra []string) []mcpConfigEntry {
 
 // jsonServers collects tincan entries from any "mcpServers" or "servers"
 // map in v, at any depth (Claude Code keeps one per project). path names
-// the map that holds v, and becomes each entry's Scope: "" at the top of
-// the file, "projects.<path>" for a Claude Code project map.
+// the map that holds v. Only a Claude Code project map ("projects.<path>")
+// becomes the entry's Scope; any other map (the top of the file, OpenClaw's
+// mcp.servers) is one the app loads everywhere, so its Scope is "".
 func jsonServers(v any, path string, out *[]mcpConfigEntry) {
 	switch t := v.(type) {
 	case []any:
@@ -128,7 +129,9 @@ func jsonServers(v any, path string, out *[]mcpConfigEntry) {
 			if servers, ok := x.(map[string]any); ok && (k == "mcpServers" || k == "servers" || k == "mcp_servers") {
 				for name, s := range servers {
 					if e, ok := jsonEntry(name, s); ok {
-						e.Scope = path
+						if strings.HasPrefix(path, "projects.") {
+							e.Scope = path
+						}
 						*out = append(*out, e)
 					}
 				}
@@ -231,6 +234,7 @@ func yamlServers(s string) []mcpConfigEntry {
 	var out []mcpConfigEntry
 	var cur *mcpConfigEntry
 	block, server := -1, -1 // indents of the mcp_servers key and of server names
+	field := -1             // indent of the current server's own keys
 	inArgs := false
 	flush := func() {
 		if cur != nil && mentionsTincan(*cur) {
@@ -249,7 +253,7 @@ func yamlServers(s string) []mcpConfigEntry {
 			block, server = -1, -1
 		}
 		if block < 0 {
-			if trimmed == "mcp_servers:" {
+			if yamlScalar(trimmed) == "mcp_servers:" {
 				block = indent
 			}
 			continue
@@ -260,6 +264,7 @@ func yamlServers(s string) []mcpConfigEntry {
 				flush()
 				server = indent
 				cur = &mcpConfigEntry{Name: yamlScalar(key)}
+				field = -1
 				inArgs = false
 			}
 			continue
@@ -269,6 +274,14 @@ func yamlServers(s string) []mcpConfigEntry {
 		}
 		if inArgs && strings.HasPrefix(trimmed, "- ") {
 			cur.Args = append(cur.Args, yamlScalar(strings.TrimPrefix(trimmed, "- ")))
+			continue
+		}
+		if field < 0 {
+			field = indent
+		}
+		if indent > field {
+			// A key in a sub-block such as env belongs to that block, not
+			// to the server.
 			continue
 		}
 		inArgs = false
