@@ -15,8 +15,8 @@ import (
 	"testing"
 )
 
-// fakeRelease serves a GitHub-shaped releases API and download tree for
-// site/install.sh.
+// fakeRelease serves a GitHub-shaped releases/latest API and download tree
+// for site/install.sh.
 type fakeRelease struct {
 	tag       string
 	asset     string
@@ -28,16 +28,16 @@ type fakeRelease struct {
 
 func (f *fakeRelease) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
-	case "/api/releases":
+	case "/api/releases/latest":
 		f.apiHits.Add(1)
 		if f.apiStatus != 0 {
 			http.Error(w, `{"message":"Not Found"}`, f.apiStatus)
 			return
 		}
-		// Pretty-printed like the real API, with a prerelease first and a
+		// Pretty-printed like the real API (one release object), with a
 		// comma inside a string to make sure the parser copes.
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte("[\n  {\n    \"url\": \"x\",\n    \"name\": \"rc, first\",\n    \"tag_name\": \"" + f.tag + "\",\n    \"prerelease\": true\n  }\n]\n"))
+		_, _ = w.Write([]byte("{\n  \"url\": \"x\",\n  \"name\": \"stable, latest\",\n  \"tag_name\": \"" + f.tag + "\",\n  \"prerelease\": false\n}\n"))
 	case "/download/" + f.tag + "/" + f.asset:
 		_, _ = w.Write(f.binary)
 	case "/download/" + f.tag + "/checksums.txt":
@@ -87,7 +87,7 @@ func runInstallScript(t *testing.T, srv *httptest.Server, env ...string) (string
 	cmd.Env = append(os.Environ(),
 		"HOME="+t.TempDir(),
 		"TINCAN_VERSION=",
-		"TINCAN_RELEASES_API="+srv.URL+"/api/releases",
+		"TINCAN_RELEASES_API="+srv.URL+"/api/releases/latest",
 		"TINCAN_DOWNLOAD_BASE="+srv.URL+"/download",
 		"TINCAN_INSTALL_DIR="+dir,
 	)
@@ -100,7 +100,7 @@ func runInstallScript(t *testing.T, srv *httptest.Server, env ...string) (string
 }
 
 func TestInstallScriptInstallsNewestRelease(t *testing.T) {
-	f := newFakeRelease(t, "v9.9.9-rc1", "9.9.9-rc1")
+	f := newFakeRelease(t, "v9.9.9", "9.9.9")
 	srv := httptest.NewServer(f)
 	defer srv.Close()
 
@@ -120,8 +120,8 @@ func TestInstallScriptInstallsNewestRelease(t *testing.T) {
 		t.Fatalf("tincan is not executable: %v", st.Mode())
 	}
 	for _, want := range []string{
-		"Installing tincan v9.9.9-rc1 (" + f.asset + ")",
-		"tincan 9.9.9-rc1",
+		"Installing tincan v9.9.9 (" + f.asset + ")",
+		"tincan 9.9.9",
 		"is not on your PATH",
 		"https://agenttincan.com",
 		"docs/quickstart.md",
@@ -136,6 +136,46 @@ func TestInstallScriptInstallsNewestRelease(t *testing.T) {
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 1 {
 		t.Errorf("install dir holds %d entries, want only tincan: %v", len(entries), entries)
+	}
+}
+
+// With no TINCAN_VERSION the installer asks GitHub for the latest release,
+// which is the newest non-prerelease, non-draft one. The releases list
+// would hand a newer rc (this project publishes many per release) to every
+// new user of the one-liner.
+func TestInstallScriptDefaultsToLatestStableRelease(t *testing.T) {
+	installScriptAsset(t)
+	script, err := os.ReadFile(filepath.Join("..", "..", "site", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `RELEASES_API="${TINCAN_RELEASES_API:-https://api.github.com/repos/mvanhorn/agent-tincan/releases/latest}"`
+	if !strings.Contains(string(script), want) {
+		t.Fatalf("install.sh does not default to the releases/latest endpoint:\n%s", want)
+	}
+	if strings.Contains(string(script), "releases?per_page") {
+		t.Fatal("install.sh still lists releases, which puts prereleases first")
+	}
+}
+
+// A prerelease is installed only when TINCAN_VERSION names it.
+func TestInstallScriptPrereleaseNeedsExplicitVersion(t *testing.T) {
+	f := newFakeRelease(t, "v9.9.9-rc1", "9.9.9-rc1")
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+
+	dir, out, err := runInstallScript(t, srv, "TINCAN_VERSION=v9.9.9-rc1")
+	if err != nil {
+		t.Fatalf("install.sh failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tincan")); err != nil {
+		t.Fatalf("tincan not installed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Installing tincan v9.9.9-rc1") {
+		t.Errorf("output lacks the prerelease tag:\n%s", out)
+	}
+	if n := f.apiHits.Load(); n != 0 {
+		t.Errorf("releases API hit %d times with TINCAN_VERSION set, want 0", n)
 	}
 }
 
@@ -192,7 +232,34 @@ func TestInstallScriptPrivateRepo(t *testing.T) {
 	if !strings.Contains(out, "downloads open when the repository is public") {
 		t.Errorf("output lacks the not-public hint:\n%s", out)
 	}
+	if !strings.Contains(out, "set TINCAN_VERSION to its tag") {
+		t.Errorf("output lacks the prerelease hint:\n%s", out)
+	}
 	if _, err := os.Stat(filepath.Join(dir, "tincan")); !os.IsNotExist(err) {
 		t.Errorf("tincan was installed after a 404 (stat err %v)", err)
+	}
+}
+
+// A missing TINCAN_VERSION tag must not suggest setting TINCAN_VERSION; the
+// no-stable-release hint belongs to the releases API fetch only.
+func TestInstallScriptMissingVersionHint(t *testing.T) {
+	f := newFakeRelease(t, "v9.9.9", "9.9.9")
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+
+	dir, out, err := runInstallScript(t, srv, "TINCAN_VERSION=v0.0.1")
+	if err == nil {
+		t.Fatalf("install.sh succeeded for a missing tag:\n%s", out)
+	}
+	if !strings.Contains(out, "Check that release v0.0.1 exists") {
+		t.Errorf("output lacks the missing-release hint:\n%s", out)
+	}
+	for _, bad := range []string{"stable release", "set TINCAN_VERSION"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("output mentions %q with TINCAN_VERSION set:\n%s", bad, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tincan")); !os.IsNotExist(err) {
+		t.Errorf("tincan was installed for a missing tag (stat err %v)", err)
 	}
 }

@@ -3,12 +3,14 @@
 #
 #   curl -fsSL https://agenttincan.com/install.sh | sh
 #
-# Downloads the newest tincan release for this machine from GitHub, checks it
-# against the release's checksums.txt, and installs it to
+# Downloads the newest stable tincan release for this machine from GitHub
+# (prereleases such as v0.6.0-rc1 are skipped unless TINCAN_VERSION names
+# one), checks it against the release's checksums.txt, and installs it to
 # ${TINCAN_INSTALL_DIR:-$HOME/.local/bin}/tincan. It never uses sudo.
 #
 # Environment:
-#   TINCAN_VERSION      release tag to install (for example v0.5.0); default newest
+#   TINCAN_VERSION      release tag to install (for example v0.5.0, or a
+#                       prerelease like v0.6.0-rc1); default newest stable
 #   TINCAN_INSTALL_DIR  where to put tincan; default $HOME/.local/bin
 #
 # TINCAN_RELEASES_API and TINCAN_DOWNLOAD_BASE override the GitHub URLs; they
@@ -17,7 +19,9 @@
 set -eu
 
 REPO_URL="https://github.com/mvanhorn/agent-tincan"
-RELEASES_API="${TINCAN_RELEASES_API:-https://api.github.com/repos/mvanhorn/agent-tincan/releases?per_page=1}"
+# releases/latest is GitHub's newest non-prerelease, non-draft release; the
+# releases list would put a newer rc first.
+RELEASES_API="${TINCAN_RELEASES_API:-https://api.github.com/repos/mvanhorn/agent-tincan/releases/latest}"
 DOWNLOAD_BASE="${TINCAN_DOWNLOAD_BASE:-$REPO_URL/releases/download}"
 QUICKSTART_URL="$REPO_URL/blob/main/docs/quickstart.md"
 
@@ -45,11 +49,14 @@ fetch() {
 	fi
 }
 
+# unreachable URL [HINT] reports a failed download. HINT, when given, is an
+# extra line of advice for that download.
 unreachable() {
 	die "could not download $1
 The Agent Tincan repository may not be public yet (GitHub answers HTTP 404
-until it is); downloads open when the repository is public. Check your
-network, or download manually from $REPO_URL/releases"
+until it is); downloads open when the repository is public.${2:+
+$2}
+Check your network, or download manually from $REPO_URL/releases"
 }
 
 sha256() {
@@ -89,7 +96,9 @@ Build from source instead: clone $REPO_URL and run make build (Go 1.26 or newer)
 }
 
 latest_tag() {
-	fetch "$RELEASES_API" "$tmp/releases.json" || unreachable "$RELEASES_API"
+	fetch "$RELEASES_API" "$tmp/releases.json" ||
+		unreachable "$RELEASES_API" "There may be no stable release yet (also a 404); to install a
+prerelease, set TINCAN_VERSION to its tag."
 	tr ',' '\n' <"$tmp/releases.json" |
 		grep '"tag_name"' |
 		head -n 1 |
@@ -107,16 +116,19 @@ main() {
 	tag="${TINCAN_VERSION:-}"
 	if [ -z "$tag" ]; then
 		tag=$(latest_tag)
-		[ -n "$tag" ] || die "no releases found at $RELEASES_API
-Download manually from $REPO_URL/releases"
+		[ -n "$tag" ] || die "no stable release found at $RELEASES_API
+Set TINCAN_VERSION to a tag (for example a prerelease) or download manually
+from $REPO_URL/releases"
 	fi
 	case "$tag" in
 	[0-9]*) tag="v$tag" ;;
 	esac
 
 	say "Installing tincan $tag ($asset)"
-	fetch "$DOWNLOAD_BASE/$tag/$asset" "$tmp/$asset" || unreachable "$DOWNLOAD_BASE/$tag/$asset"
-	fetch "$DOWNLOAD_BASE/$tag/checksums.txt" "$tmp/checksums.txt" || unreachable "$DOWNLOAD_BASE/$tag/checksums.txt"
+	fetch "$DOWNLOAD_BASE/$tag/$asset" "$tmp/$asset" ||
+		unreachable "$DOWNLOAD_BASE/$tag/$asset" "Check that release $tag exists."
+	fetch "$DOWNLOAD_BASE/$tag/checksums.txt" "$tmp/checksums.txt" ||
+		unreachable "$DOWNLOAD_BASE/$tag/checksums.txt" "Check that release $tag exists."
 
 	want=$(awk -v f="$asset" '$2 == f || $2 == "*" f {print $1; exit}' "$tmp/checksums.txt")
 	[ -n "$want" ] || die "checksums.txt for $tag has no entry for $asset"

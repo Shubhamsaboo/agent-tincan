@@ -161,7 +161,7 @@ Put the `tincan` binary on the relay host and on every agent's machine (and on a
 curl -fsSL https://agenttincan.com/install.sh | sh
 ```
 
-The installer picks the build for the machine (macOS on Apple silicon or Intel, Linux on x86-64 or ARM64), downloads the newest release from GitHub, checks it against the release's `checksums.txt`, and installs it to `~/.local/bin/tincan` without `sudo`. Set `TINCAN_INSTALL_DIR` to install elsewhere, or `TINCAN_VERSION=v0.5.0` to pin a release. Or download manually from the [releases page](https://github.com/mvanhorn/agent-tincan/releases): `tincan_<os>_<arch>` plus `checksums.txt`. There is no Windows build; build from source with `make build`.
+The installer picks the build for the machine (macOS on Apple silicon or Intel, Linux on x86-64 or ARM64), downloads the newest stable release from GitHub, checks it against the release's `checksums.txt`, and installs it to `~/.local/bin/tincan` without `sudo`. Set `TINCAN_INSTALL_DIR` to install elsewhere, or `TINCAN_VERSION=v0.5.0` to pin a release. Prereleases such as `v0.6.0-rc1` install only when `TINCAN_VERSION` names them. Or download manually from the [releases page](https://github.com/mvanhorn/agent-tincan/releases): `tincan_<os>_<arch>` plus `checksums.txt`. There is no Windows build; build from source with `make build`.
 
 Step by step, including the relay and your first two agents: [docs/quickstart.md](docs/quickstart.md).
 
