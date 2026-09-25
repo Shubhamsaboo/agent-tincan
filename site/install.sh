@@ -3,12 +3,14 @@
 #
 #   curl -fsSL https://agenttincan.com/install.sh | sh
 #
-# Downloads the newest tincan release for this machine from GitHub, checks it
-# against the release's checksums.txt, and installs it to
+# Downloads the newest stable tincan release for this machine from GitHub
+# (prereleases such as v0.6.0-rc1 are skipped unless TINCAN_VERSION names
+# one), checks it against the release's checksums.txt, and installs it to
 # ${TINCAN_INSTALL_DIR:-$HOME/.local/bin}/tincan. It never uses sudo.
 #
 # Environment:
-#   TINCAN_VERSION      release tag to install (for example v0.5.0); default newest
+#   TINCAN_VERSION      release tag to install (for example v0.5.0, or a
+#                       prerelease like v0.6.0-rc1); default newest stable
 #   TINCAN_INSTALL_DIR  where to put tincan; default $HOME/.local/bin
 #
 # TINCAN_RELEASES_API and TINCAN_DOWNLOAD_BASE override the GitHub URLs; they
@@ -17,7 +19,9 @@
 set -eu
 
 REPO_URL="https://github.com/mvanhorn/agent-tincan"
-RELEASES_API="${TINCAN_RELEASES_API:-https://api.github.com/repos/mvanhorn/agent-tincan/releases?per_page=1}"
+# releases/latest is GitHub's newest non-prerelease, non-draft release; the
+# releases list would put a newer rc first.
+RELEASES_API="${TINCAN_RELEASES_API:-https://api.github.com/repos/mvanhorn/agent-tincan/releases/latest}"
 DOWNLOAD_BASE="${TINCAN_DOWNLOAD_BASE:-$REPO_URL/releases/download}"
 QUICKSTART_URL="$REPO_URL/blob/main/docs/quickstart.md"
 
@@ -47,9 +51,10 @@ fetch() {
 
 unreachable() {
 	die "could not download $1
-The Agent Tincan repository may not be public yet (GitHub answers HTTP 404
-until it is); downloads open when the repository is public. Check your
-network, or download manually from $REPO_URL/releases"
+The Agent Tincan repository may not be public yet, or may have no stable
+release yet (GitHub answers HTTP 404 in both cases); downloads open when the repository is public
+and a release is out. To install a prerelease, set TINCAN_VERSION to its tag.
+Check your network, or download manually from $REPO_URL/releases"
 }
 
 sha256() {
@@ -107,8 +112,9 @@ main() {
 	tag="${TINCAN_VERSION:-}"
 	if [ -z "$tag" ]; then
 		tag=$(latest_tag)
-		[ -n "$tag" ] || die "no releases found at $RELEASES_API
-Download manually from $REPO_URL/releases"
+		[ -n "$tag" ] || die "no stable release found at $RELEASES_API
+Set TINCAN_VERSION to a tag (for example a prerelease) or download manually
+from $REPO_URL/releases"
 	fi
 	case "$tag" in
 	[0-9]*) tag="v$tag" ;;
