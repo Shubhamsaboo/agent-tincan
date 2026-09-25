@@ -190,8 +190,9 @@ func agentsCmd() *cobra.Command {
 		Short: "List agents in the mesh, whether they are online, how they wake, when each last called the relay, and which tincan build each runs",
 		Long: `List agents in the mesh, whether they are online, how they wake, when each
 last called the relay, and which tincan build each last called with. The
-first line names the relay's own build, so an agent that has not run tincan
-upgrade stands out.
+first line, "# relay version X", names the relay's own build, so an agent
+that has not run tincan upgrade stands out. It starts with "# " so scripts
+can skip it; every other line is one agent.
 
 Works from any joined agent (saved config). An admin device that never joined
 passes --relay <url> (or sets TINCAN_RELAY), and the relay host can use
@@ -220,11 +221,12 @@ passes --relay <url> (or sets TINCAN_RELAY), and the relay host can use
 }
 
 // formatRoster is formatAgents with a first line naming the relay's own
-// build, when the relay reports one.
+// build, when the relay reports one. The line starts with "# " so a script
+// reading one agent per line can skip it.
 func formatRoster(ro client.Roster, now time.Time) string {
 	out := formatAgents(ro.Agents, now)
 	if ro.RelayVersion != "" {
-		out = "relay version " + ro.RelayVersion + "\n" + out
+		out = "# relay version " + ro.RelayVersion + "\n" + out
 	}
 	return out
 }

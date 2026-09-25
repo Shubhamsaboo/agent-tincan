@@ -157,7 +157,7 @@ func TestFormatRosterNamesRelayVersion(t *testing.T) {
 	now := time.Now()
 	agents := []client.AgentInfo{{Name: "muse", Wake: "wait", Version: "0.5.1"}}
 	got := formatRoster(client.Roster{Agents: agents, RelayVersion: "0.5.2"}, now)
-	want := "relay version 0.5.2\nmuse           offline  wake=wait never seen version=0.5.1\n"
+	want := "# relay version 0.5.2\nmuse           offline  wake=wait never seen version=0.5.1\n"
 	if got != want {
 		t.Fatalf("roster =\n%s\nwant\n%s", got, want)
 	}
