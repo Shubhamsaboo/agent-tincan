@@ -190,7 +190,7 @@ tincan join ABCD-EFGH --relay http://tincan-relay # agent's machine
 
 `invite` prints the code and the join command to run, with the relay URL filled in when it knows it (from `--relay` or a saved config). `--kind` records the agent's runtime so `tincan onboard` tailors its setup (kinds are listed under [Onboarding](#onboarding); `tincan kind <name> <kind>` changes it later). Inviting a name again retires the earlier code for it if that code was not used yet. `join` saves the relay URL and agent name in the client config (`TINCAN_CONFIG` when set). `--proxy` saves a proxy used only for relay traffic, for sandboxes that reach the tailnet through a proxy.
 
-An admin device usually never joins, so it has no saved config. Admin and roster commands (`invite`, `remove`, `kind`, `agents`, `trace`, `audit-verify`) take `--relay <url>`, or `--socket <state-dir>/admin.sock` on the relay host. Two environment variables override the saved config for any command: `TINCAN_RELAY` (the relay URL) and `TINCAN_PROXY` (the proxy). For example, `TINCAN_RELAY=http://tincan-relay tincan agents`.
+An admin device usually never joins, so it has no saved config. Admin and roster commands (`invite`, `remove`, `kind`, `agents`, `trace`, `audit-verify`, `onboard`) take `--relay <url>`; on the relay host they need no flags (its local admin socket is used; `--socket <state-dir>/admin.sock` names one elsewhere). Two environment variables override the saved config for any command: `TINCAN_RELAY` (the relay URL) and `TINCAN_PROXY` (the proxy). For example, `TINCAN_RELAY=http://tincan-relay tincan agents`.
 
 `tincan remove <name>` cuts an agent off immediately: its queued requests are cancelled and, for ChatGPT, its tokens are revoked.
 

@@ -192,10 +192,11 @@ func agentsCmd() *cobra.Command {
 each last called the relay.
 
 Works from any joined agent (saved config). An admin device that never joined
-passes --relay <url> (or sets TINCAN_RELAY), and the relay host can use
---socket <state-dir>/admin.sock.`,
+passes --relay <url> (or sets TINCAN_RELAY). The relay host needs no flags:
+its local admin socket is used, like the other admin commands (--socket
+names one elsewhere).`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if socket == "" && relayURL == "" {
+			if socket == "" && relayURL == "" && localAdminSocket() == "" {
 				if cfg, _ := client.LoadConfig(); cfg.Relay == "" {
 					return errors.New("no relay configured: on an admin device pass --relay <url> (or set TINCAN_RELAY), on the relay host pass --socket <state-dir>/admin.sock, or run `tincan join <code> --relay <url>` on an agent")
 				}

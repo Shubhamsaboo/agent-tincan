@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,7 +15,7 @@ import (
 
 func onboardCmd() *cobra.Command {
 	var asJSON, offline bool
-	var section, operator, owner, relayURL string
+	var section, operator, owner, relayURL, socket string
 	var kinds []string
 	cmd := &cobra.Command{
 		Use:   "onboard",
@@ -29,8 +30,10 @@ func onboardCmd() *cobra.Command {
 
 Onboarding only reads the roster. It never invites, joins, or removes agents;
 run "tincan invite <name>" from an admin device for that. Works from any
-joined agent or admin device. --offline skips the roster (no network) and
-prints the operator prompt and recipes, for setting up before anyone joins.`,
+joined agent or admin device, and on the relay host with no flags (its local
+admin socket is used, like the admin commands). --offline skips the roster
+(no network) and prints the operator prompt and recipes, for setting up
+before anyone joins.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			overrides, err := parseKinds(kinds)
@@ -47,14 +50,11 @@ prints the operator prompt and recipes, for setting up before anyone joins.`,
 			o := onboard.Options{RelayURL: cfg.Relay, Owner: owner, Operator: operator, KindOverrides: overrides, Offline: offline}
 			var roster mcpserver.Roster
 			if !offline {
-				if cfg.Relay == "" {
-					return errors.New("no relay configured: pass --relay <url>, run `tincan join <code> --relay <url>`, or use --offline to print the operator prompt and recipes without the roster")
-				}
-				r, err := client.NewRelayFor(cfg)
+				r, relay, err := onboardRoster(cmd.Context(), socket, cfg)
 				if err != nil {
 					return err
 				}
-				roster = r
+				roster, o.RelayURL = r, relay
 			}
 			k, err := mcpserver.Onboard(cmd.Context(), roster, o, section)
 			if err != nil {
@@ -73,8 +73,42 @@ prints the operator prompt and recipes, for setting up before anyone joins.`,
 	cmd.Flags().StringVar(&owner, "owner", "", "the person who owns the team, used in the generated text")
 	cmd.Flags().StringArrayVar(&kinds, "kind", nil, "name=kind to tailor an agent's block, overriding its stored kind (repeatable; kinds: "+strings.Join(onboard.Kinds, ", ")+")")
 	cmd.Flags().StringVar(&relayURL, "relay", "", "relay URL to read the roster from and print in the kit (default: saved config)")
+	cmd.Flags().StringVar(&socket, "socket", "", "relay admin socket to read the roster through (default on the relay host: its own)")
 	cmd.Flags().BoolVar(&offline, "offline", false, "skip the roster and make no network call: operator prompt and recipes only")
 	return cmd
+}
+
+// onboardRoster picks where the roster is read from, and the relay URL the
+// kit prints: --socket, else the saved config or --relay (already in cfg),
+// else, on the relay host, its local admin socket, which is how the admin
+// commands work there too. Over a socket the kit names the relay by the
+// address the relay advertises to agents, since the socket's own address
+// means nothing to them.
+func onboardRoster(ctx context.Context, socket string, cfg client.Config) (mcpserver.Roster, string, error) {
+	if socket == "" && cfg.Relay == "" {
+		socket = localAdminSocket()
+	}
+	if socket == "" {
+		if cfg.Relay == "" {
+			return nil, "", errors.New("no relay configured: pass --relay <url>, run `tincan join <code> --relay <url>`, or use --offline to print the operator prompt and recipes without the roster")
+		}
+		r, err := client.NewRelayFor(cfg)
+		return r, cfg.Relay, err
+	}
+	r := client.NewRelaySocket(socket)
+	return r, advertisedRelayURL(ctx, r), nil
+}
+
+// advertisedRelayURL asks the relay behind an admin socket where agents
+// reach it, falling back to a placeholder the kit's reader fills in.
+func advertisedRelayURL(ctx context.Context, r *client.Relay) string {
+	var urls struct {
+		RelayURLs []string `json:"relay_urls"`
+	}
+	if r.Raw(ctx, "GET", "/v1/admin/urls", nil, &urls) == nil && len(urls.RelayURLs) > 0 {
+		return urls.RelayURLs[0]
+	}
+	return "<relay URL>"
 }
 
 // parseKinds turns repeated name=kind flags into overrides. onboard.Build
