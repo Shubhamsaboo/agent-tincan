@@ -49,11 +49,13 @@ fetch() {
 	fi
 }
 
+# unreachable URL [HINT] reports a failed download. HINT, when given, is an
+# extra line of advice for that download.
 unreachable() {
 	die "could not download $1
-The Agent Tincan repository may not be public yet, or may have no stable
-release yet (GitHub answers HTTP 404 in both cases); downloads open when the repository is public
-and a release is out. To install a prerelease, set TINCAN_VERSION to its tag.
+The Agent Tincan repository may not be public yet (GitHub answers HTTP 404
+until it is); downloads open when the repository is public.${2:+
+$2}
 Check your network, or download manually from $REPO_URL/releases"
 }
 
@@ -94,7 +96,9 @@ Build from source instead: clone $REPO_URL and run make build (Go 1.26 or newer)
 }
 
 latest_tag() {
-	fetch "$RELEASES_API" "$tmp/releases.json" || unreachable "$RELEASES_API"
+	fetch "$RELEASES_API" "$tmp/releases.json" ||
+		unreachable "$RELEASES_API" "There may be no stable release yet (also a 404); to install a
+prerelease, set TINCAN_VERSION to its tag."
 	tr ',' '\n' <"$tmp/releases.json" |
 		grep '"tag_name"' |
 		head -n 1 |
@@ -121,8 +125,10 @@ from $REPO_URL/releases"
 	esac
 
 	say "Installing tincan $tag ($asset)"
-	fetch "$DOWNLOAD_BASE/$tag/$asset" "$tmp/$asset" || unreachable "$DOWNLOAD_BASE/$tag/$asset"
-	fetch "$DOWNLOAD_BASE/$tag/checksums.txt" "$tmp/checksums.txt" || unreachable "$DOWNLOAD_BASE/$tag/checksums.txt"
+	fetch "$DOWNLOAD_BASE/$tag/$asset" "$tmp/$asset" ||
+		unreachable "$DOWNLOAD_BASE/$tag/$asset" "Check that release $tag exists."
+	fetch "$DOWNLOAD_BASE/$tag/checksums.txt" "$tmp/checksums.txt" ||
+		unreachable "$DOWNLOAD_BASE/$tag/checksums.txt" "Check that release $tag exists."
 
 	want=$(awk -v f="$asset" '$2 == f || $2 == "*" f {print $1; exit}' "$tmp/checksums.txt")
 	[ -n "$want" ] || die "checksums.txt for $tag has no entry for $asset"

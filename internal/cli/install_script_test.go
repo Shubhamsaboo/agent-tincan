@@ -232,7 +232,34 @@ func TestInstallScriptPrivateRepo(t *testing.T) {
 	if !strings.Contains(out, "downloads open when the repository is public") {
 		t.Errorf("output lacks the not-public hint:\n%s", out)
 	}
+	if !strings.Contains(out, "set TINCAN_VERSION to its tag") {
+		t.Errorf("output lacks the prerelease hint:\n%s", out)
+	}
 	if _, err := os.Stat(filepath.Join(dir, "tincan")); !os.IsNotExist(err) {
 		t.Errorf("tincan was installed after a 404 (stat err %v)", err)
+	}
+}
+
+// A missing TINCAN_VERSION tag must not suggest setting TINCAN_VERSION; the
+// no-stable-release hint belongs to the releases API fetch only.
+func TestInstallScriptMissingVersionHint(t *testing.T) {
+	f := newFakeRelease(t, "v9.9.9", "9.9.9")
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+
+	dir, out, err := runInstallScript(t, srv, "TINCAN_VERSION=v0.0.1")
+	if err == nil {
+		t.Fatalf("install.sh succeeded for a missing tag:\n%s", out)
+	}
+	if !strings.Contains(out, "Check that release v0.0.1 exists") {
+		t.Errorf("output lacks the missing-release hint:\n%s", out)
+	}
+	for _, bad := range []string{"stable release", "set TINCAN_VERSION"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("output mentions %q with TINCAN_VERSION set:\n%s", bad, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tincan")); !os.IsNotExist(err) {
+		t.Errorf("tincan was installed for a missing tag (stat err %v)", err)
 	}
 }
