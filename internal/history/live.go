@@ -136,7 +136,13 @@ func (l *live) Read(ctx context.Context, q Query, opts Options) ([]Conversation,
 		return l.resolve(ctx, out), nil
 	}
 	w, owned := l.window.orDefault(), l.agentOwned()
-	cands, err := l.list(ctx, w.Max)
+	// The web agents' chats are skipped below without using up a window
+	// slot, so ask for enough extra to cover them, as List does.
+	fetch := w.Max
+	if !opts.All {
+		fetch += len(owned)
+	}
+	cands, err := l.list(ctx, fetch)
 	if err != nil {
 		return nil, err
 	}

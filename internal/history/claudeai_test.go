@@ -254,3 +254,37 @@ func TestWebUsedKeepsNewestAndSkipsBadIDs(t *testing.T) {
 		t.Fatalf("corrupt file: %v", got)
 	}
 }
+
+func TestClaudeAIWebAgentChatsDoNotUseUpTheWindow(t *testing.T) {
+	used := filepath.Join(t.TempDir(), "web-agent-claude-ai-conversations.json")
+	if err := recordWebUsed(used, "c1a0d000-0000-4000-8000-000000000001", liveNow); err != nil {
+		t.Fatal(err)
+	}
+	ch := claudeFake(t)
+	r := newTestClaudeAI(ch)
+	r.AgentChats = used
+	r.Window = Window{Max: 1, MaxAge: DefaultWindow().MaxAge}
+	ctx := context.Background()
+
+	// The newest chat is the web agent's; a window of one still reaches
+	// Matt's own newest chat behind it, as List already did.
+	convs, err := r.Read(ctx, Query{Source: SourceClaudeAI, Mode: ModeLatest}, Options{})
+	if err != nil || len(convs) != 1 || convs[0].ID != "c1a0d000-0000-4000-8000-000000000002" {
+		t.Fatalf("latest past the web agent's chat: %+v %v", convs, err)
+	}
+	ch.mu.Lock()
+	asked := ch.calls[0].Args.Count
+	ch.mu.Unlock()
+	if asked != 2 {
+		t.Fatalf("list asked for %d conversations, want the window plus the web agent's one", asked)
+	}
+	convs, err = r.Read(ctx, Query{Source: SourceClaudeAI, Mode: ModeSearch, Terms: []string{"packing"}}, Options{})
+	if err != nil || len(convs) != 1 || convs[0].ID != "c1a0d000-0000-4000-8000-000000000002" {
+		t.Fatalf("search past the web agent's chat: %+v %v", convs, err)
+	}
+	// With all, the web agent's chat is the one inside the window.
+	convs, err = r.Read(ctx, Query{Source: SourceClaudeAI, Mode: ModeLatest}, Options{All: true})
+	if err != nil || len(convs) != 1 || convs[0].ID != "c1a0d000-0000-4000-8000-000000000001" || !convs[0].Automated {
+		t.Fatalf("latest with all: %+v %v", convs, err)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -674,4 +675,36 @@ func TestServeWithImagesNothingFound(t *testing.T) {
 		t.Fatalf("reply %q", res.Reply.Body)
 	}
 	rig.assertNoImageDirsLeft(t)
+}
+
+func TestRenderReplyLongConversationShowsNewestPrompts(t *testing.T) {
+	c := Conversation{Source: SourceCodex, ID: "01a0c000-0000-7000-8000-00000000000a", Title: "Long thread"}
+	for i := 1; i <= maxPromptsInConv+5; i++ {
+		c.Messages = append(c.Messages,
+			Message{Role: RoleUser, Text: fmt.Sprintf("PROMPT-%02d", i)},
+			Message{Role: RoleAssistant, Text: fmt.Sprintf("REPLY-%02d", i)})
+	}
+	q := Query{Source: SourceCodex, Mode: ModeConversation, ConversationID: c.ID}
+	out := renderReply(q, []Conversation{c})
+	for _, want := range []string{"(5 earlier prompts not shown)", "PROMPT-06", "Reply excerpt: REPLY-06", "PROMPT-25", "Reply excerpt: REPLY-25"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("reply lacks %q:\n%s", want, out)
+		}
+	}
+	for _, skipped := range []string{"PROMPT-01", "REPLY-01", "PROMPT-05", "REPLY-05"} {
+		if strings.Contains(out, skipped) {
+			t.Errorf("reply shows %q, which is before the newest %d prompts:\n%s", skipped, maxPromptsInConv, out)
+		}
+	}
+	if strings.Index(out, "not shown") > strings.Index(out, "PROMPT-06") {
+		t.Errorf("the note comes after the prompts it is about:\n%s", out)
+	}
+	if n := strings.Count(out, "Reply excerpt:"); n != maxPromptsInConv {
+		t.Errorf("want one excerpt per shown prompt, got %d:\n%s", n, out)
+	}
+	// A short conversation is complete and carries no note.
+	short := renderReply(q, []Conversation{{Source: SourceCodex, ID: c.ID, Messages: c.Messages[:4]}})
+	if strings.Contains(short, "not shown") || !strings.Contains(short, "PROMPT-01") || !strings.Contains(short, "Reply excerpt: REPLY-02") {
+		t.Errorf("short conversation:\n%s", short)
+	}
 }

@@ -206,3 +206,25 @@ func TestClaudeCodeWithImagesPicksOlderTurnThatHasImages(t *testing.T) {
 		t.Fatalf("images = %s, want red", colors(t, u.Images))
 	}
 }
+
+func TestClaudeCodeInjectedElementIsNotAPrompt(t *testing.T) {
+	for _, s := range []string{
+		"<scheduled-task>\n<task-id>nightly</task-id>\nrun the nightly report\n</scheduled-task>",
+		"<create-pr-command>open a PR for this branch</create-pr-command>",
+		"<some-new-kind id=\"7\">\nwhatever the Desktop app adds next\n</some-new-kind>",
+	} {
+		if got, ok := claudePromptText(s); ok {
+			t.Errorf("claudePromptText(%q) = %q, want skipped", s, got)
+		}
+	}
+	for _, s := range []string{
+		"<b>bold</b> is html, so why does <i> exist?",
+		"what does <br> do",
+		"<foo> is a tag I saw in a transcript, what is it?",
+		"[Image #1] summarize the relay design in this diagram",
+	} {
+		if got, ok := claudePromptText(s); !ok || got != s {
+			t.Errorf("claudePromptText(%q) = %q %v, want the prompt", s, got, ok)
+		}
+	}
+}

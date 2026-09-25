@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -161,11 +162,26 @@ var claudeBuiltins = map[string]bool{
 }
 
 // claudeInjected are prefixes of user-role text that Claude Code writes
-// itself.
+// itself. The Desktop app's scheduled tasks and Create PR button are
+// among them: their records look typed (origin human, promptSource sdk).
 var claudeInjected = []string{
 	"<local-command-", "<task-notification", "<system-reminder>", "<bash-",
 	"<fork-boilerplate>", "<user-prompt-submit-hook>", "[Request interrupted",
-	"Caveat: The messages below",
+	"Caveat: The messages below", "<scheduled-task", "<create-pr-command",
+}
+
+// openTag matches the start of an XML element and captures its name.
+var openTag = regexp.MustCompile(`^<([A-Za-z][A-Za-z0-9_-]*)[\s>]`)
+
+// injectedElement reports whether s is one XML element, <name>...</name>
+// with nothing outside it. Everything Claude Code writes into the user
+// role itself has that shape, and the Desktop app keeps adding kinds, so
+// the claudeInjected prefixes alone would report each new kind as
+// something Matt typed until it was listed. A person does not open a
+// message with a tag and close it with the same one.
+func injectedElement(s string) bool {
+	m := openTag.FindStringSubmatch(s)
+	return m != nil && strings.HasSuffix(s, "</"+m[1]+">")
 }
 
 // claudePromptText turns user-role text into Matt's prompt, or reports
@@ -191,6 +207,9 @@ func claudePromptText(s string) (string, bool) {
 		if strings.HasPrefix(s, p) {
 			return "", false
 		}
+	}
+	if injectedElement(s) {
+		return "", false
 	}
 	return s, true
 }

@@ -476,22 +476,27 @@ func renderReply(q Query, convs []Conversation) string {
 		if c.Cwd != "" {
 			fmt.Fprintf(&b, "Working directory: %s\n", c.Cwd)
 		}
-		prompts := 0
+		// A long conversation shows its newest prompts: everything before
+		// the first shown prompt, replies included, is left out and counted.
+		var promptAt []int
+		for i, m := range c.Messages {
+			if m.Role == RoleUser {
+				promptAt = append(promptAt, i)
+			}
+		}
+		prompts := len(promptAt)
+		shown := c.Messages
+		if skip := prompts - maxPromptsInConv; skip > 0 {
+			fmt.Fprintf(&b, "(%d earlier prompts not shown)\n", skip)
+			shown = c.Messages[promptAt[skip]:]
+		}
 		var lastReply string
-		var when time.Time
-		for _, m := range c.Messages {
+		for _, m := range shown {
 			switch m.Role {
 			case RoleUser:
-				prompts++
-				if prompts > maxPromptsInConv {
-					continue
-				}
 				ts := m.Time
 				if ts.IsZero() {
 					ts = c.UpdatedAt
-				}
-				if when.IsZero() || ts.After(when) {
-					when = ts
 				}
 				fmt.Fprintf(&b, "The owner asked%s:\n%s\n", stamp(ts), capRunes(m.Text, maxPromptRunes))
 			case RoleAssistant:
@@ -501,9 +506,6 @@ func renderReply(q Query, convs []Conversation) string {
 					lastReply = ""
 				}
 			}
-		}
-		if prompts > maxPromptsInConv {
-			fmt.Fprintf(&b, "(%d earlier prompts not shown)\n", prompts-maxPromptsInConv)
 		}
 		if prompts == 0 {
 			fmt.Fprintf(&b, "Last updated%s\n", stamp(c.UpdatedAt))
