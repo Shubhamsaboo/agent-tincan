@@ -37,8 +37,9 @@ export const ID_WAIT_MS = 60 * 1000;
 export const KEEP_TAB_MS = 10 * 60 * 1000;
 
 // SELECTORS is the one table of page selectors, tried in order. login and
-// loginPaths mean the page is logged out. stop, streaming, assistant and
-// user only help confirm that the page took the message; they are never
+// loginPaths mean the page is logged out. stop and streaming refuse a send
+// into a conversation that is still answering, and with assistant and user
+// they help confirm that the page took the message. None of them is ever
 // used to decide that a reply is finished.
 export const SELECTORS = Object.freeze({
   chatgpt: Object.freeze({
