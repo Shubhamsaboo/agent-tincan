@@ -106,7 +106,13 @@ func runDoctor(ctx context.Context, exe string, extraConfigs []string) doctorRep
 			break
 		}
 		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		me, err := r.WhoAmI(cctx)
+		// whoami also says whether this relay hands out its key, which
+		// decides what a key missing from the saved config means below.
+		var me struct {
+			Name     string `json:"name"`
+			RelayKey string `json:"relay_key"`
+		}
+		err = r.Raw(cctx, "GET", "/v1/whoami", nil, &me)
 		cancel()
 		switch {
 		case client.IsNotJoined(err):
@@ -119,13 +125,23 @@ func runDoctor(ctx context.Context, exe string, extraConfigs []string) doctorRep
 			joined = true
 			add(check{"relay", "ok", fmt.Sprintf("reachable at %s; this machine is agent %q", r.Base(), me.Name), ""})
 			client.LearnRelayKey(ctx, r)
-			if saved, _ := client.LoadConfig(); saved.RelayKey != "" {
+			saved, _ := client.LoadConfig()
+			switch {
+			case saved.RelayKey != "":
 				add(check{"relay moves", "ok", "the relay key is saved, so this agent finds the relay by itself if its address changes", ""})
 				if len(saved.RelayURLs) > 0 {
 					add(addressCheck(ctx, r, saved.RelayURLs))
 				}
-			} else {
+			case me.RelayKey == "":
 				add(check{"relay moves", "warn", "the relay did not hand out its key (relay older than 0.5.0-rc12), so this agent cannot find the relay by itself if its address changes", "Upgrade the relay, then run tincan doctor again."})
+			case os.Getenv("TINCAN_RELAY") != "":
+				// The client never writes a relay it was given by the
+				// environment back to the file, so the key is dropped.
+				add(check{"relay moves", "warn", "the relay hands out its key, but TINCAN_RELAY overrides the saved config, so the key is not saved and this agent cannot find the relay by itself if its address changes",
+					"Save the relay in " + client.ConfigPath() + " instead: run tincan rejoin --relay " + cfg.Relay + " with TINCAN_RELAY unset, and stop setting it."})
+			default:
+				add(check{"relay moves", "warn", "the relay hands out its key, but it could not be saved to " + client.ConfigPath(),
+					"Check that the file is writable and names the relay at " + r.Base() + ", then run tincan doctor again."})
 			}
 		}
 	}
@@ -400,7 +416,7 @@ func hostFix(exe string) []string {
 	return []string{
 		"Remove every tincan server from the app, including old or oddly named ones (for example \"user-tincan\" or \"user-tincan mcp\"). The mcp config entries above show where they are.",
 		"Add exactly one server named tincan: " + string(entry),
-		"Use the full path to the binary and put mcp in args, not in the command. Claude Code adds --channel after mcp for channel wakes.",
+		"Use the full path to the binary and put mcp in args, not in the command. Claude Code adds --channel after mcp for channel wakes, and claude mcp add needs --scope user for the server to exist in every project (its default scope keeps it to the directory it was added in).",
 		"Quit and reopen the app (a reload of one server is not always enough), then start a new chat.",
 		"Run tincan doctor again: app launches should say the app listed the tools.",
 	}
@@ -417,7 +433,11 @@ func printDoctor(w io.Writer, rep doctorReport) {
 	if len(rep.Configs) > 0 {
 		fmt.Fprintln(w, "\nMCP config entries that mention tincan:")
 		for _, e := range rep.Configs {
-			fmt.Fprintf(w, "  %s: %q runs %s %s", e.File, e.Name, e.Command, strings.Join(e.Args, " "))
+			fmt.Fprintf(w, "  %s", e.File)
+			if e.Scope != "" {
+				fmt.Fprintf(w, " (%s)", e.Scope)
+			}
+			fmt.Fprintf(w, ": %q runs %s %s", e.Name, e.Command, strings.Join(e.Args, " "))
 			if len(e.Problems) > 0 {
 				fmt.Fprintf(w, "  <- %s", strings.Join(e.Problems, "; "))
 			}

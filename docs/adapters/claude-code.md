@@ -13,8 +13,10 @@ tincan join <code> --relay http://tincan-relay
 ## Add the MCP server
 
 ```bash
-claude mcp add agent-tincan -- tincan mcp --channel
+claude mcp add --scope user agent-tincan -- tincan mcp --channel
 ```
+
+`--scope user` registers the server for every project. The default scope is the directory the command runs in, so a session started anywhere else would have no tincan tools and no channel.
 
 That gives the session the tools (`ask`, `check_inbox`, `reply`, `get_reply`, `list_agents`, `cancel`, `claim`, `trace`, `onboard`, `get_attachment`) and, with `--channel`, pushes teammate requests straight into the running session.
 
