@@ -177,7 +177,7 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	}
 
 	dir := identity.NewDirectory(st, identity.WithVirtual(who), f.directoryConfig())
-	srv := relay.New(dir, st, relay.Config{})
+	srv := relay.New(dir, st, relay.Config{Version: Version})
 	urls := who.SelfURLs(ctx, f.port)
 	srv.SetURLs(urls)
 	log.Printf("tincan relay advertises %s to its agents", strings.Join(urls, ", "))

@@ -134,18 +134,34 @@ func TestInviteNextStepMentionsSecondAgentConfig(t *testing.T) {
 }
 
 // tincan agents shows how long ago each agent last polled, so a dead wait or
-// listen loop is visible.
+// listen loop is visible, and the build each agent last called with, so one
+// that has not upgraded is visible too.
 func TestFormatAgentsShowsLastSeen(t *testing.T) {
 	now := time.Now()
 	got := formatAgents([]client.AgentInfo{
 		{Name: "muse", Wake: "wait", LastPoll: now.Add(-12*time.Minute - 5*time.Second)},
-		{Name: "grokbot", Online: true, Wake: "webhook", Kind: "openclaw", LastPoll: now},
+		{Name: "grokbot", Online: true, Wake: "webhook", Kind: "openclaw", LastPoll: now, Version: "0.5.2"},
 		{Name: "chatgpt", Wake: "none"},
 	}, now)
 	want := "muse           offline  wake=wait last seen 12m ago\n" +
-		"grokbot        online   wake=webhook last seen just now kind=openclaw\n" +
+		"grokbot        online   wake=webhook last seen just now kind=openclaw version=0.5.2\n" +
 		"chatgpt        offline  wake=none never seen\n"
 	if got != want {
 		t.Fatalf("agents =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// The relay's own build heads the list when the relay reports one, so an
+// agent behind it stands out; a relay that predates it adds no line.
+func TestFormatRosterNamesRelayVersion(t *testing.T) {
+	now := time.Now()
+	agents := []client.AgentInfo{{Name: "muse", Wake: "wait", Version: "0.5.1"}}
+	got := formatRoster(client.Roster{Agents: agents, RelayVersion: "0.5.2"}, now)
+	want := "relay version 0.5.2\nmuse           offline  wake=wait never seen version=0.5.1\n"
+	if got != want {
+		t.Fatalf("roster =\n%s\nwant\n%s", got, want)
+	}
+	if got := formatRoster(client.Roster{Agents: agents}, now); got != formatAgents(agents, now) {
+		t.Fatalf("roster without a relay version =\n%s", got)
 	}
 }

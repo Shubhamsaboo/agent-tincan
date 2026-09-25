@@ -210,7 +210,7 @@ Every agent gets the same tools, either from the MCP server (`tincan mcp`, stdio
 | `claim` | (done by `inbox`) | Mark a delivered request as yours. `check_inbox` already does this. |
 | `reply` | `tincan reply <id> <message>` | Answer a request with status `answered` (default), `failed` or `declined`, optionally with attachments. |
 | `cancel` | `tincan cancel <id>` | Withdraw a request nobody has picked up yet. |
-| `list_agents` | `tincan agents` | The roster: online or not, wake method, kind, and when each agent last called the relay. |
+| `list_agents` | `tincan agents` | The roster: online or not, wake method, kind, when each agent last called the relay, and which tincan build each runs. |
 | `trace` | `tincan trace [trace-id]` | Show a request chain step by step. Agents see chains they took part in; admins see every chain. |
 | `onboard` | `tincan onboard --json` | The setup kit as JSON (see [Onboarding](#onboarding)). Read-only. |
 | `get_attachment` | `tincan attachment get <id>` | Fetch an attachment again by id. |
@@ -258,7 +258,7 @@ An `ask` may return before the answer does, and the asker does not have to hold 
 
 ### Last seen
 
-`tincan agents` (and `list_agents`) shows each agent's state, wake method, kind, and when it last called the relay by polling or by any send, reply or get ("last seen 12m ago", or "never seen"). A wait or listen loop that died shows up as a growing last seen.
+`tincan agents` (and `list_agents`) shows each agent's state, wake method, kind, and when it last called the relay by polling or by any send, reply or get ("last seen 12m ago", or "never seen"). A wait or listen loop that died shows up as a growing last seen. It also shows the tincan build each agent last called with (`version=0.5.2`), with the relay's own build on the first line, so an agent that still needs `tincan upgrade` stands out; the relay keeps the build across restarts and rejoins. An agent shows no version until it has called a relay that records them.
 
 ### Upgrades
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,6 +35,9 @@ type Config struct {
 	SweepEvery    time.Duration
 	Now           func() time.Time
 	Attachments   AttachmentConfig
+	// Version is this relay's tincan build, reported to agents in the
+	// roster and whoami so a client behind it stands out; "" hides it.
+	Version string
 }
 
 func (c *Config) defaults() {
@@ -107,6 +111,10 @@ type Server struct {
 	// persistEvery per agent.
 	lastSeen  map[string]time.Time
 	persisted map[string]time.Time
+	// versions is the tincan build each agent last called with, from the
+	// client's version header, loaded from the store at start and written
+	// back whenever it changes.
+	versions map[string]string
 }
 
 // persistEvery bounds how often an agent's activity is written to the store.
@@ -116,7 +124,37 @@ const persistEvery = time.Minute
 func New(dir *identity.Directory, st *store.Store, cfg Config) *Server {
 	cfg.defaults()
 	return &Server{cfg: cfg, dir: dir, store: st, hub: newHub(), prep: newChain{}, lastPoll: map[string]time.Time{}, polling: map[string]int{},
-		lastSeen: map[string]time.Time{}, persisted: map[string]time.Time{}, blobs: defaultAttachmentDir(st), key: loadRelayKey(st)}
+		lastSeen: map[string]time.Time{}, persisted: map[string]time.Time{}, versions: loadVersions(st), blobs: defaultAttachmentDir(st), key: loadRelayKey(st)}
+}
+
+// loadVersions reads the build each agent last reported, so a restarted
+// relay's roster shows them before the agents call again. A failed read is
+// logged; versions are then learned again as agents call.
+func loadVersions(st *store.Store) map[string]string {
+	if st == nil {
+		return map[string]string{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	vs, err := st.AgentVersions(ctx)
+	if err != nil {
+		log.Printf("agent versions: %v", err)
+		return map[string]string{}
+	}
+	return vs
+}
+
+// versionRE is what a client's build name may look like before the relay
+// records it: git describe output such as 0.5.2 or 0.5.2-3-gabcdef-dirty.
+var versionRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+
+// cleanVersion returns v when it is a plausible build name, else "".
+func cleanVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if !versionRE.MatchString(v) {
+		return ""
+	}
+	return v
 }
 
 // SetPreparer installs the chain and policy step.
@@ -287,16 +325,20 @@ func (s *Server) agent(w http.ResponseWriter, r *http.Request) string {
 			"agent": rb.Agent, "old_node": rb.OldNode, "old_node_name": rb.OldNodeName, "new_node": rb.NewNode, "new_node_name": rb.NewNodeName,
 		}))
 	}
-	s.seen(r.Context(), res.Name)
+	s.seen(r.Context(), res.Name, r.Header.Get(client.VersionHeader))
 	return res.Name
 }
 
-// seen records that agent called the relay. The in-memory time moves on
-// every call; the store is written at most once per persistEvery so that
-// activity survives a restart without a write per request. A failed write is
+// seen records that agent called the relay, running the tincan build named
+// by version ("" from a client that predates the header). The in-memory
+// time moves on every call; the store is written at most once per
+// persistEvery so that activity survives a restart without a write per
+// request. The build is written only when it changes, so an upgrade shows in
+// the roster at once and an unchanged one costs nothing. A failed write is
 // logged and never fails the request.
-func (s *Server) seen(ctx context.Context, agent string) {
+func (s *Server) seen(ctx context.Context, agent, version string) {
 	now := s.cfg.Now()
+	version = cleanVersion(version)
 	s.mu.Lock()
 	if now.After(s.lastSeen[agent]) {
 		s.lastSeen[agent] = now
@@ -306,14 +348,25 @@ func (s *Server) seen(ctx context.Context, agent string) {
 	if write {
 		s.persisted[agent] = now
 	}
+	writeVersion := version != "" && s.versions[agent] != version
+	if writeVersion {
+		s.versions[agent] = version
+	}
 	s.mu.Unlock()
-	if !write {
+	if !write && !writeVersion {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := s.store.TouchAgent(ctx, agent, now); err != nil {
-		log.Printf("last seen for %s: %v", agent, err)
+	if write {
+		if err := s.store.TouchAgent(ctx, agent, now); err != nil {
+			log.Printf("last seen for %s: %v", agent, err)
+		}
+	}
+	if writeVersion {
+		if err := s.store.SetAgentVersion(ctx, agent, version); err != nil {
+			log.Printf("version for %s: %v", agent, err)
+		}
 	}
 }
 
@@ -329,7 +382,11 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": name, "kind": a.Kind, "relay_key": s.key, "relay_urls": s.urls})
+	out := map[string]any{"name": name, "kind": a.Kind, "relay_key": s.key, "relay_urls": s.urls}
+	if s.cfg.Version != "" {
+		out["relay_version"] = s.cfg.Version
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -702,14 +759,18 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		if p := persisted[a.Name]; p.After(active) {
 			active = p
 		}
-		info := client.AgentInfo{Name: a.Name, LastPoll: last, LastActive: active, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none", Kind: a.Kind}
+		info := client.AgentInfo{Name: a.Name, LastPoll: last, LastActive: active, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none", Kind: a.Kind, Version: s.versions[a.Name]}
 		if s.wake != nil {
 			info.Wake = s.wake.WakeMethod(a.Name)
 		}
 		out = append(out, info)
 	}
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
+	res := map[string]any{"agents": out}
+	if s.cfg.Version != "" {
+		res["relay_version"] = s.cfg.Version
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
@@ -826,6 +887,14 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, statusFor(err), err)
 		return
 	}
+	// What the relay remembered about the name in memory goes with it, so
+	// an agent joined later under the same name starts with a clean row.
+	s.mu.Lock()
+	delete(s.lastPoll, in.Name)
+	delete(s.lastSeen, in.Name)
+	delete(s.persisted, in.Name)
+	delete(s.versions, in.Name)
+	s.mu.Unlock()
 	s.record(r.Context(), "removed", "", "", in.Name, store.DetailJSON(map[string]any{"cancelled": len(ids)}))
 	writeJSON(w, http.StatusOK, map[string]any{"removed": in.Name, "cancelled": len(ids)})
 }

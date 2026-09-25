@@ -22,6 +22,15 @@ import (
 // from. The relay honors it only for an agent bound to that machine.
 const AgentHeader = "X-Tincan-Agent"
 
+// VersionHeader carries the tincan build the client runs on every relay
+// call, so the roster can show which agents are behind.
+const VersionHeader = "X-Tincan-Version"
+
+// Version is the tincan build this process runs, sent as VersionHeader by
+// every relay client made after it is set. main sets it from the link-time
+// version; it stays "" (and the header is left out) in other programs.
+var Version string
+
 // Result mirrors the relay's view of one request.
 type Result = envelope.Result
 
@@ -41,6 +50,18 @@ type AgentInfo struct {
 	LastActive time.Time `json:"last_active,omitzero"`
 	Wake       string    `json:"wake"`
 	Kind       string    `json:"kind,omitempty"` // agent runtime (hermes, codex, ...), empty when unknown
+	// Version is the tincan build the agent last called the relay with,
+	// empty when it has not called since the relay learned to record it,
+	// or runs a client that predates the version header.
+	Version string `json:"version,omitempty"`
+}
+
+// Roster is the relay's agent list with what the relay says about itself.
+type Roster struct {
+	Agents []AgentInfo `json:"agents"`
+	// RelayVersion is the tincan build the relay runs, "" from a relay
+	// that predates it.
+	RelayVersion string `json:"relay_version,omitempty"`
 }
 
 // State is "online" or "offline".
@@ -107,11 +128,12 @@ func (e *APIError) Error() string { return fmt.Sprintf("relay: %s (HTTP %d)", e.
 
 // Relay talks to a tincan relay.
 type Relay struct {
-	baseMu sync.RWMutex
-	base   string
-	api    *http.Client
-	polls  *http.Client
-	agent  string // sent as AgentHeader when set
+	baseMu  sync.RWMutex
+	base    string
+	api     *http.Client
+	polls   *http.Client
+	agent   string // sent as AgentHeader when set
+	version string // sent as VersionHeader when set
 
 	// key is the relay key from the saved config. When the relay stops
 	// answering at base, the client looks for the peer that proves it
@@ -145,7 +167,7 @@ func NewRelay(base, proxy string) (*Relay, error) {
 			}
 		}
 	}
-	return &Relay{base: base, api: api, polls: polls}, nil
+	return &Relay{base: base, api: api, polls: polls, version: Version}, nil
 }
 
 // NewRelayFor returns a client for a saved config. It names the configured
@@ -178,7 +200,7 @@ func NewRelaySocket(path string) *Relay {
 		return d.DialContext(ctx, "unix", path)
 	}}
 	c := &http.Client{Timeout: 30 * time.Second, Transport: tr}
-	return &Relay{base: "http://tincan-admin", api: c, polls: c}
+	return &Relay{base: "http://tincan-admin", api: c, polls: c, version: Version}
 }
 
 // Base is the relay URL this client talks to.
@@ -320,11 +342,15 @@ func (r *Relay) Cancel(ctx context.Context, id string) error {
 
 // Agents lists joined agents.
 func (r *Relay) Agents(ctx context.Context) ([]AgentInfo, error) {
-	var out struct {
-		Agents []AgentInfo `json:"agents"`
-	}
+	ro, err := r.Roster(ctx)
+	return ro.Agents, err
+}
+
+// Roster lists joined agents along with the relay's own build.
+func (r *Relay) Roster(ctx context.Context) (Roster, error) {
+	var out Roster
 	err := r.call(ctx, r.api, "GET", "/v1/agents", nil, &out)
-	return out.Agents, err
+	return out, err
 }
 
 // Join binds this machine to the agent name behind code.
@@ -384,9 +410,7 @@ func (r *Relay) DownloadDist(ctx context.Context, name string, w io.Writer) erro
 	if err != nil {
 		return err
 	}
-	if r.agent != "" {
-		req.Header.Set(AgentHeader, r.agent)
-	}
+	r.headers(req)
 	resp, err := r.withTimeout(DistDownloadTimeout).Do(req)
 	if err != nil {
 		return err
@@ -435,9 +459,7 @@ func (r *Relay) callOnce(ctx context.Context, c *http.Client, method, path strin
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if r.agent != "" {
-		req.Header.Set(AgentHeader, r.agent)
-	}
+	r.headers(req)
 	resp, err := c.Do(req)
 	if err != nil {
 		return err
@@ -466,6 +488,16 @@ func (r *Relay) callOnce(ctx context.Context, c *http.Client, method, path strin
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
 	return nil
+}
+
+// headers names this client's agent and build on a relay request.
+func (r *Relay) headers(req *http.Request) {
+	if r.agent != "" {
+		req.Header.Set(AgentHeader, r.agent)
+	}
+	if r.version != "" {
+		req.Header.Set(VersionHeader, r.version)
+	}
 }
 
 // IsStatus reports whether err is a relay error with the given HTTP code.
