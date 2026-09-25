@@ -136,7 +136,7 @@ tincan trace <trace-id> # one chain, step by step
 tincan audit-verify     # check the log has not been altered
 ```
 
-On an admin device that never joined, add `--relay http://tincan-relay` to each (or set `TINCAN_RELAY`); on the relay host, `--socket <state-dir>/admin.sock` works too.
+On an admin device that never joined, add `--relay http://tincan-relay` to each (or set `TINCAN_RELAY`). On the relay host they need no flags: its local admin socket is used. Pass `--socket <state-dir>/admin.sock` only for a socket elsewhere.
 
 ## Upgrading
 
