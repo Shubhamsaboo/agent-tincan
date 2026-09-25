@@ -82,3 +82,16 @@ func TestAgentsAndOnboardWithoutRelaySayHow(t *testing.T) {
 		t.Fatalf("onboard with nothing configured: %v", err)
 	}
 }
+
+// An explicit --socket wins over a saved relay, and when the relay advertises
+// no address the kit prints a placeholder for the reader to fill in.
+func TestOnboardExplicitSocketAndRelayURLPlaceholder(t *testing.T) {
+	m := testrelay.New(t, relay.Config{})
+	useConfig(t, client.Config{Relay: "http://127.0.0.1:1"})
+	serveAdminSocket(t, m)
+
+	k := onboardKit(t, "--section", "agents", "--socket", filepath.Join(defaultStateDir(), "admin.sock"))
+	if len(k.Agents) != 3 || k.RelayURL != "<relay URL>" {
+		t.Fatalf("onboard --socket with no advertised URLs: %d agents, relay %q", len(k.Agents), k.RelayURL)
+	}
+}

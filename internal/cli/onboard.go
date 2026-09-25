@@ -30,8 +30,8 @@ func onboardCmd() *cobra.Command {
 
 Onboarding only reads the roster. It never invites, joins, or removes agents;
 run "tincan invite <name>" from an admin device for that. Works from any
-joined agent or admin device, and on the relay host with no flags (its local
-admin socket is used, like the admin commands). --offline skips the roster
+joined agent or admin device, and on the relay host with no flags (when no
+relay is saved or given, its local admin socket is used). --offline skips the roster
 (no network) and prints the operator prompt and recipes, for setting up
 before anyone joins.`,
 		Args: cobra.NoArgs,
