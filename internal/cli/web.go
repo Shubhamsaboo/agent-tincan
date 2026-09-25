@@ -106,7 +106,7 @@ func webServeCmd() *cobra.Command {
 			if client.NeedsRelayInfo(cfg) {
 				// Nothing else runs as this agent, so the service learns the
 				// relay key itself; without it a moved relay is never found.
-				client.LearnRelayKey(ctx, r)
+				learnRelayKeyWithin(ctx, r)
 			}
 			me, err := r.WhoAmI(ctx)
 			if err != nil {

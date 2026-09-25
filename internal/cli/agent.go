@@ -44,9 +44,26 @@ func learnRelayInfo(ctx context.Context, cfg client.Config) {
 	if err != nil {
 		return
 	}
+	learnRelayKeyWithin(ctx, r)
+}
+
+// learnRelayKeyWithin is client.LearnRelayKey with the same 5-second bound
+// connect uses, so a relay that accepts the connection but never answers
+// cannot hold up join, rejoin or a service's startup.
+func learnRelayKeyWithin(ctx context.Context, r *client.Relay) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	client.LearnRelayKey(ctx, r)
+}
+
+// setRelay points cfg at url. The relay key and addresses belong to the old
+// relay, so a different url drops them: if learnRelayInfo then fails, the
+// config must not pair the new address with the old relay's key.
+func setRelay(cfg *client.Config, url string) {
+	if strings.TrimRight(url, "/") != strings.TrimRight(cfg.Relay, "/") {
+		cfg.RelayKey, cfg.RelayURLs, cfg.RelayInfoAt = "", nil, time.Time{}
+	}
+	cfg.Relay = url
 }
 
 func agentCmds() []*cobra.Command {
@@ -63,7 +80,7 @@ func joinCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _ := client.LoadConfig()
 			if relayURL != "" {
-				cfg.Relay = relayURL
+				setRelay(&cfg, relayURL)
 			}
 			if cmd.Flags().Changed("proxy") {
 				cfg.Proxy = proxy

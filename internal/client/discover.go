@@ -274,28 +274,26 @@ func NeedsRelayInfo(c Config) bool {
 // LearnRelayKey asks the relay (whoami) for its key and advertised
 // addresses, keeps them on r, and saves them to the config file r was built
 // from (NewRelayFor or NewRelayForFile), so this client can find the relay
-// again if its address changes. It reports whether the relay handed out a
-// key, whether or not it was saved. It is quiet on failure: the information
-// is only needed later.
-func LearnRelayKey(ctx context.Context, r *Relay) bool {
+// again if its address changes. It is quiet on failure: the information is
+// only needed later.
+func LearnRelayKey(ctx context.Context, r *Relay) {
 	var out struct {
 		RelayKey  string   `json:"relay_key"`
 		RelayURLs []string `json:"relay_urls"`
 	}
 	if r.callOnce(ctx, r.api, "GET", "/v1/whoami", nil, &out) != nil || out.RelayKey == "" {
-		return false
+		return
 	}
 	r.findMu.Lock()
 	r.key, r.known = out.RelayKey, out.RelayURLs
 	r.findMu.Unlock()
 	if r.configFile == "" {
-		return true
+		return
 	}
 	c, err := loadSavedConfig(r.configFile)
 	if err != nil || strings.TrimRight(c.Relay, "/") != r.Base() {
-		return true
+		return
 	}
 	c.RelayKey, c.RelayURLs, c.RelayInfoAt = out.RelayKey, out.RelayURLs, time.Now().UTC()
 	_ = SaveConfigTo(r.configFile, c)
-	return true
 }

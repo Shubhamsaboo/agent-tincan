@@ -30,7 +30,7 @@ Only a machine that was never joined needs a first-time invite from an admin.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, _ := client.LoadConfig()
 			if relayURL != "" {
-				cfg.Relay = relayURL
+				setRelay(&cfg, relayURL)
 			}
 			if cmd.Flags().Changed("proxy") {
 				cfg.Proxy = proxy

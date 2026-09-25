@@ -284,7 +284,7 @@ func historyServeCmd() *cobra.Command {
 			if client.NeedsRelayInfo(cfg) {
 				// Nothing else runs as this agent, so the service learns the
 				// relay key itself; without it a moved relay is never found.
-				client.LearnRelayKey(ctx, r)
+				learnRelayKeyWithin(ctx, r)
 			}
 			// The relay, not the config file, says who this machine is. Serving
 			// as any other agent would poll and claim that agent's inbox.

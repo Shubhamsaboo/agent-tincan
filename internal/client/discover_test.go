@@ -154,28 +154,6 @@ func TestLearnRelayInfoSavesURLsAndRefreshes(t *testing.T) {
 	}
 }
 
-// LearnRelayKey says whether the relay handed out a key, so a caller can
-// tell "no key from the relay" from "key received but not saved".
-func TestLearnRelayKeyReportsWhetherKeyGiven(t *testing.T) {
-	savedConfig(t, Config{Relay: "http://unused"})
-	r, _ := NewRelayFor(Config{Relay: fakeRelay(t, "k")})
-	if !LearnRelayKey(t.Context(), r) {
-		t.Fatal("a relay that hands out its key should report true")
-	}
-	noKey := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"name": "muse"})
-	}))
-	t.Cleanup(noKey.Close)
-	r, _ = NewRelayFor(Config{Relay: noKey.URL})
-	if LearnRelayKey(t.Context(), r) {
-		t.Fatal("a relay without a key should report false")
-	}
-	r, _ = NewRelayFor(Config{Relay: deadURL(t)})
-	if LearnRelayKey(t.Context(), r) {
-		t.Fatal("an unreachable relay should report false")
-	}
-}
-
 // readConfig reads a config file as saved, with no environment overrides.
 func readConfig(t *testing.T, path string) Config {
 	t.Helper()
@@ -205,8 +183,9 @@ func TestNewRelayForFileWritesToItsOwnFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !LearnRelayKey(t.Context(), r) {
-		t.Fatal("no key learned")
+	LearnRelayKey(t.Context(), r)
+	if r.key != key {
+		t.Fatalf("key learned %q", r.key)
 	}
 	if c := readConfig(t, own); c.RelayKey != key || c.Agent != "history" || len(c.RelayURLs) == 0 || c.RelayInfoAt.IsZero() {
 		t.Fatalf("own config %+v", c)
@@ -256,8 +235,9 @@ func TestEnvRelayOverrideNeverWrites(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !LearnRelayKey(t.Context(), r) {
-			t.Fatalf("%s: the key is still handed out under TINCAN_RELAY", name)
+		LearnRelayKey(t.Context(), r)
+		if r.key != key {
+			t.Fatalf("%s: the key is still handed out under TINCAN_RELAY, got %q", name, r.key)
 		}
 		if c := readConfig(t, ConfigPath()); c.RelayKey != "" {
 			t.Fatalf("%s: ConfigPath() written under TINCAN_RELAY: %+v", name, c)

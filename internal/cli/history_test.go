@@ -391,6 +391,10 @@ func TestServeLearnsRelayKeyIntoItsOwnConfig(t *testing.T) {
 			other := filepath.Join(t.TempDir(), "client.json")
 			t.Setenv("TINCAN_CONFIG", other)
 			t.Setenv("TINCAN_RELAY", "")
+			t.Setenv("TINCAN_PROXY", "")
+			// history serve checks the native-host manifest and web serve keeps
+			// its state under HOME, so neither touches the real one.
+			t.Setenv("HOME", t.TempDir())
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

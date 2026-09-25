@@ -1,11 +1,15 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/relay"
@@ -132,5 +136,46 @@ func TestRejoinErrorOldMachineStillOnline(t *testing.T) {
 	named := &client.APIError{Code: 403, Message: `online-box: not a joined agent`}
 	if err := rejoinError(named, cfg); !strings.Contains(err.Error(), "first-time invite") {
 		t.Fatalf("never-joined machine named online = %v", err)
+	}
+}
+
+// join and rejoin with --relay at a different relay drop the old relay's
+// key and addresses, so a failed learnRelayInfo cannot leave the new address
+// paired with the old key. The same relay (a trailing slash aside) keeps
+// them.
+func TestSetRelayDropsOldRelayInfo(t *testing.T) {
+	at := time.Now().UTC()
+	saved := client.Config{Relay: "http://old-relay", Agent: "grokbot", RelayKey: "k-old", RelayURLs: []string{"http://old-relay"}, RelayInfoAt: at}
+
+	cfg := saved
+	setRelay(&cfg, "http://old-relay/")
+	if cfg.Relay != "http://old-relay/" || cfg.RelayKey != "k-old" || len(cfg.RelayURLs) != 1 || !cfg.RelayInfoAt.Equal(at) {
+		t.Fatalf("same relay lost its info: %+v", cfg)
+	}
+
+	cfg = saved
+	setRelay(&cfg, "http://new-relay")
+	if cfg.Relay != "http://new-relay" || cfg.RelayKey != "" || cfg.RelayURLs != nil || !cfg.RelayInfoAt.IsZero() || cfg.Agent != "grokbot" {
+		t.Fatalf("new relay kept the old relay's info: %+v", cfg)
+	}
+}
+
+// rejoin --relay at a new relay that hands out no key (older than
+// 0.5.0-rc12) leaves no key in the config, not the old relay's.
+func TestRejoinAtNewRelayDropsOldKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": "grokbot"})
+	}))
+	t.Cleanup(srv.Close)
+	useConfig(t, client.Config{Relay: "http://old-relay", Agent: "grokbot", RelayKey: "k-old", RelayURLs: []string{"http://old-relay"}, RelayInfoAt: time.Now().UTC()})
+	if out, err := run(t, rejoinCmd(), "--relay", srv.URL); err != nil {
+		t.Fatalf("rejoin: %v\n%s", err, out)
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil || cfg.Relay != srv.URL || cfg.Agent != "grokbot" {
+		t.Fatalf("config = %+v, %v", cfg, err)
+	}
+	if cfg.RelayKey != "" || cfg.RelayURLs != nil || !cfg.RelayInfoAt.IsZero() {
+		t.Fatalf("the new relay's config kept the old relay's info: %+v", cfg)
 	}
 }
