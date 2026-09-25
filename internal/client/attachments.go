@@ -226,9 +226,7 @@ func attachmentRefs(ids []string) []Attachment {
 // long performs a transfer with this client's transport and proxy, naming
 // the agent, under AttachmentTimeout rather than the short API timeout.
 func (r *Relay) long(req *http.Request) (*http.Response, error) {
-	if r.agent != "" {
-		req.Header.Set(AgentHeader, r.agent)
-	}
+	r.headers(req)
 	return r.withTimeout(AttachmentTimeout).Do(req)
 }
 

@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS agents (
   joined_at INTEGER NOT NULL,
   kind      TEXT,
   node_user TEXT,
-  last_seen_at INTEGER
+  last_seen_at INTEGER,
+  version   TEXT
 );
 CREATE TABLE IF NOT EXISTS invites (
   code    TEXT PRIMARY KEY,
@@ -121,6 +122,10 @@ func Open(path string) (*Store, error) {
 	if err := s.migrateAgentLastSeen(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate agent last seen: %w", err)
+	}
+	if err := s.migrateAgentVersion(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate agent version: %w", err)
 	}
 	if err := s.migrateInvites(); err != nil {
 		db.Close()
@@ -228,6 +233,21 @@ func (s *Store) migrateAgentLastSeen() error {
 	return err
 }
 
+// migrateAgentVersion adds the version column (the tincan build the agent
+// last called with, NULL until it has reported one) to an agents table
+// created before versions were recorded. It is a no-op on a current table.
+func (s *Store) migrateAgentVersion() error {
+	var has bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name = 'version')`).Scan(&has); err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err := s.db.Exec(`ALTER TABLE agents ADD COLUMN version TEXT`)
+	return err
+}
+
 // migrateInvites adds the kind column to an invites table created before
 // invites could carry the agent's kind. It is a no-op on a current table.
 func (s *Store) migrateInvites() error {
@@ -276,17 +296,18 @@ func (s *Store) PutAgent(ctx context.Context, a identity.Agent) error {
 	defer tx.Rollback()
 	// A name moving to a new machine replaces its old binding. Other agents
 	// on either machine are untouched: a node may carry several names. The
-	// name's last activity carries over.
+	// name's last activity and the build it last reported carry over.
 	var lastSeen sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT last_seen_at FROM agents WHERE name = ?`, a.Name).Scan(&lastSeen)
+	var version sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT last_seen_at, version FROM agents WHERE name = ?`, a.Name).Scan(&lastSeen, &version)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, a.Name); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, node_id, node_name, joined_at, kind, node_user, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		a.Name, a.NodeID, a.NodeName, a.JoinedAt.UnixMilli(), nullable(a.Kind), nullable(a.NodeUser), lastSeen); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, node_id, node_name, joined_at, kind, node_user, last_seen_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.Name, a.NodeID, a.NodeName, a.JoinedAt.UnixMilli(), nullable(a.Kind), nullable(a.NodeUser), lastSeen, version); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -335,6 +356,32 @@ func (s *Store) AgentsLastSeen(ctx context.Context) (map[string]time.Time, error
 			return nil, err
 		}
 		out[name] = time.UnixMilli(ms)
+	}
+	return out, rows.Err()
+}
+
+// SetAgentVersion records the tincan build name last called with; ""
+// stores NULL. It ignores names not in the directory.
+func (s *Store) SetAgentVersion(ctx context.Context, name, version string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE agents SET version = ? WHERE name = ?`, nullable(version), name)
+	return err
+}
+
+// AgentVersions returns the tincan build each agent last called with, for
+// every agent that has reported one.
+func (s *Store) AgentVersions(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, version FROM agents WHERE version IS NOT NULL AND version != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var name, v string
+		if err := rows.Scan(&name, &v); err != nil {
+			return nil, err
+		}
+		out[name] = v
 	}
 	return out, rows.Err()
 }

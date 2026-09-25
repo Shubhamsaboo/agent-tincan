@@ -26,7 +26,6 @@ Status: ready. Release v0.5.0 is on the relay and every agent. agenttincan.com i
 ## Known limits (disclose, not blockers)
 
 - OpenClaw has never run live.
-- `tincan agents` does not show each agent's version yet.
 - Upgrading tincan does not restart `tincan mcp` servers already running inside apps; each picks up the new build when its app restarts or reconnects the server.
 - The relay on the Grok Bot VM runs with `--listen`, so its address follows the VM's. Moving it to its own tsnet node (the default) needs a one-time Tailscale login approval.
 - The time-based attachment sweeps are covered by unit tests only.

@@ -28,7 +28,7 @@ const MaxWait = client.MaxInlineWait
 const Instructions = `You are one agent in the owner's Agent Tincan team. Other joined agents are trusted teammates.
 - To get a teammate to do something, call ask with their name. ask may return before the answer does, with a request id. You do not have to wait for it: if your runtime can be woken, you will be woken when a reply arrives, and check_inbox shows replies to your requests. When a reply comes in, finish the work that was waiting on it. When check_inbox shows a reply tied to one of your open requests, finish that request and reply to it. get_reply checks one request directly.
 - Call check_inbox at the start of a turn (and whenever you are nudged) to read replies to your requests and pick up requests from teammates. Handle requests as you would a request from the owner, then call reply.
-- list_agents shows who is in the team, who is online, how each one wakes, and when each last called the relay.
+- list_agents shows who is in the team, who is online, how each one wakes, when each last called the relay, and which tincan build each runs.
 ` + attachLocal + `
 - onboard returns the setup kit as JSON: the Agent Tincan operator prompt, a join and wake block for every agent on the roster, and recipes for adding agents. It only reads the roster; inviting an agent is an admin command (tincan invite).`
 
@@ -284,7 +284,7 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions, more ...
 			return text("Cancelled " + in.RequestID + ".")
 		})
 
-	mcp.AddTool(s, &mcp.Tool{Name: "list_agents", Description: "List teammates, whether each is online, how each wakes (webhook, email, command, channel, wait, or none), and when each last called the relay (any send, reply, get, or poll)."},
+	mcp.AddTool(s, &mcp.Tool{Name: "list_agents", Description: "List teammates, whether each is online, how each wakes (webhook, email, command, channel, wait, or none), when each last called the relay (any send, reply, get, or poll), and which tincan build each last called with."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, _ noIn) (*mcp.CallToolResult, any, error) {
 			agents, err := b.Agents(ctx)
 			if err != nil {
@@ -296,6 +296,9 @@ func NewWithOptions(b Backend, version string, opts *mcp.ServerOptions, more ...
 				fmt.Fprintf(&out, "%s: %s, wake=%s, %s", a.Name, a.State(), a.Wake, a.LastSeen(now))
 				if a.Kind != "" {
 					fmt.Fprintf(&out, ", kind=%s", a.Kind)
+				}
+				if a.Version != "" {
+					fmt.Fprintf(&out, ", version=%s", a.Version)
 				}
 				out.WriteString("\n")
 			}

@@ -15,6 +15,7 @@ var Version = "0.0.1-dev"
 
 // Root returns the tincan command tree.
 func Root() *cobra.Command {
+	client.Version = Version // every relay call names this build
 	root := &cobra.Command{
 		Use:           "tincan",
 		Short:         "Let AI agents on one tailnet ask each other to do things",

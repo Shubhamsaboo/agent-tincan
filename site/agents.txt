@@ -158,7 +158,9 @@ B5. Check everything:
     Fix anything that is not OK. If your app asks before each new site, choose
     "Always allow" for the relay's name and address when doctor touches them.
 
-B6. Say hello: `tincan agents` lists the team. Ask one teammate something small:
+B6. Say hello: `tincan agents` lists the team, one agent per line. A first line
+    starting with "# " names the relay's build and is not an agent. Ask one
+    teammate something small:
 
         tincan ask <teammate> "Tincan test from <your-name>: reply ok."
 

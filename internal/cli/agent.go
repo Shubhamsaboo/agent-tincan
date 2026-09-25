@@ -187,9 +187,12 @@ func agentsCmd() *cobra.Command {
 	var relayURL, socket string
 	cmd := &cobra.Command{
 		Use:   "agents",
-		Short: "List agents in the mesh, whether they are online, how they wake, and when each last called the relay",
-		Long: `List agents in the mesh, whether they are online, how they wake, and when
-each last called the relay.
+		Short: "List agents in the mesh, whether they are online, how they wake, when each last called the relay, and which tincan build each runs",
+		Long: `List agents in the mesh, whether they are online, how they wake, when each
+last called the relay, and which tincan build each last called with. The
+first line, "# relay version X", names the relay's own build, so an agent
+that has not run tincan upgrade stands out. It starts with "# " so scripts
+can skip it; every other line is one agent.
 
 Works from any joined agent (saved config). An admin device that never joined
 passes --relay <url> (or sets TINCAN_RELAY). The relay host needs no flags:
@@ -205,11 +208,11 @@ names one elsewhere).`,
 			if err != nil {
 				return err
 			}
-			agents, err := r.Agents(cmd.Context())
+			ro, err := r.Roster(cmd.Context())
 			if err != nil {
 				return err
 			}
-			cmd.Print(formatAgents(agents, time.Now()))
+			cmd.Print(formatRoster(ro, time.Now()))
 			return nil
 		},
 	}
@@ -218,12 +221,26 @@ names one elsewhere).`,
 	return cmd
 }
 
+// formatRoster is formatAgents with a first line naming the relay's own
+// build, when the relay reports one. The line starts with "# " so a script
+// reading one agent per line can skip it.
+func formatRoster(ro client.Roster, now time.Time) string {
+	out := formatAgents(ro.Agents, now)
+	if ro.RelayVersion != "" {
+		out = "# relay version " + ro.RelayVersion + "\n" + out
+	}
+	return out
+}
+
 func formatAgents(agents []client.AgentInfo, now time.Time) string {
 	var b strings.Builder
 	for _, a := range agents {
 		fmt.Fprintf(&b, "%-14s %-8s wake=%s %s", a.Name, a.State(), a.Wake, a.LastSeen(now))
 		if a.Kind != "" {
 			fmt.Fprintf(&b, " kind=%s", a.Kind)
+		}
+		if a.Version != "" {
+			fmt.Fprintf(&b, " version=%s", a.Version)
 		}
 		b.WriteString("\n")
 	}
