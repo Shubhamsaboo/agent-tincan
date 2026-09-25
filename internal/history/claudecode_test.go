@@ -222,6 +222,10 @@ func TestClaudeCodeInjectedElementIsNotAPrompt(t *testing.T) {
 		"what does <br> do",
 		"<foo> is a tag I saw in a transcript, what is it?",
 		"[Image #1] summarize the relay design in this diagram",
+		"<instructions>\nRefactor the relay auth to use mTLS\n</instructions>",
+		"<svg viewBox=\"0 0 1 1\"></svg>",
+		"<b>Note</b>: fix <b>today</b>",
+		"<my-notes>first</my-notes> and <my-notes>second</my-notes>",
 	} {
 		if got, ok := claudePromptText(s); !ok || got != s {
 			t.Errorf("claudePromptText(%q) = %q %v, want the prompt", s, got, ok)

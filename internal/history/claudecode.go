@@ -174,14 +174,20 @@ var claudeInjected = []string{
 var openTag = regexp.MustCompile(`^<([A-Za-z][A-Za-z0-9_-]*)[\s>]`)
 
 // injectedElement reports whether s is one XML element, <name>...</name>
-// with nothing outside it. Everything Claude Code writes into the user
-// role itself has that shape, and the Desktop app keeps adding kinds, so
-// the claudeInjected prefixes alone would report each new kind as
-// something Matt typed until it was listed. A person does not open a
-// message with a tag and close it with the same one.
+// with nothing outside it, whose name has a '-' or '_'. Everything Claude
+// Code writes into the user role itself has that shape, and the Desktop
+// app keeps adding kinds, so the claudeInjected prefixes alone would
+// report each new kind as something Matt typed until it was listed.
+// People do wrap prompts in tags like <instructions> or paste HTML and
+// SVG, so a plain one-word name is never taken as injected, and the
+// first closing tag must be the one at the end.
 func injectedElement(s string) bool {
 	m := openTag.FindStringSubmatch(s)
-	return m != nil && strings.HasSuffix(s, "</"+m[1]+">")
+	if m == nil || !strings.ContainsAny(m[1], "-_") {
+		return false
+	}
+	end := "</" + m[1] + ">"
+	return strings.HasSuffix(s, end) && strings.Index(s, end) == len(s)-len(end)
 }
 
 // claudePromptText turns user-role text into Matt's prompt, or reports

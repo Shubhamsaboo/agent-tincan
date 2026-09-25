@@ -479,9 +479,9 @@ func renderReply(q Query, convs []Conversation) string {
 		// A long conversation shows its newest prompts: everything before
 		// the first shown prompt, replies included, is left out and counted.
 		var promptAt []int
-		for i, m := range c.Messages {
+		for j, m := range c.Messages {
 			if m.Role == RoleUser {
-				promptAt = append(promptAt, i)
+				promptAt = append(promptAt, j)
 			}
 		}
 		prompts := len(promptAt)
