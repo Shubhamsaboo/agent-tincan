@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -161,11 +162,32 @@ var claudeBuiltins = map[string]bool{
 }
 
 // claudeInjected are prefixes of user-role text that Claude Code writes
-// itself.
+// itself. The Desktop app's scheduled tasks and Create PR button are
+// among them: their records look typed (origin human, promptSource sdk).
 var claudeInjected = []string{
 	"<local-command-", "<task-notification", "<system-reminder>", "<bash-",
 	"<fork-boilerplate>", "<user-prompt-submit-hook>", "[Request interrupted",
-	"Caveat: The messages below",
+	"Caveat: The messages below", "<scheduled-task", "<create-pr-command",
+}
+
+// openTag matches the start of an XML element and captures its name.
+var openTag = regexp.MustCompile(`^<([A-Za-z][A-Za-z0-9_-]*)[\s>]`)
+
+// injectedElement reports whether s is one XML element, <name>...</name>
+// with nothing outside it, whose name has a '-' or '_'. Everything Claude
+// Code writes into the user role itself has that shape, and the Desktop
+// app keeps adding kinds, so the claudeInjected prefixes alone would
+// report each new kind as something Matt typed until it was listed.
+// People do wrap prompts in tags like <instructions> or paste HTML and
+// SVG, so a plain one-word name is never taken as injected, and the
+// first closing tag must be the one at the end.
+func injectedElement(s string) bool {
+	m := openTag.FindStringSubmatch(s)
+	if m == nil || !strings.ContainsAny(m[1], "-_") {
+		return false
+	}
+	end := "</" + m[1] + ">"
+	return strings.HasSuffix(s, end) && strings.Index(s, end) == len(s)-len(end)
 }
 
 // claudePromptText turns user-role text into Matt's prompt, or reports
@@ -191,6 +213,9 @@ func claudePromptText(s string) (string, bool) {
 		if strings.HasPrefix(s, p) {
 			return "", false
 		}
+	}
+	if injectedElement(s) {
+		return "", false
 	}
 	return s, true
 }
