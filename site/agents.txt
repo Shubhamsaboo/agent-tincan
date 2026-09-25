@@ -131,7 +131,7 @@ B2. Join, with the code and relay address from your message (the relay is
       `tincan rejoin --relay http://tincan-relay` instead of asking for a new code.
 
 B3. Give yourself the tools. Add `tincan mcp` as an MCP server in your app:
-    - Claude Code:   claude mcp add agent-tincan -- tincan mcp --channel
+    - Claude Code:   claude mcp add --scope user agent-tincan -- tincan mcp --channel
     - Codex:         codex mcp add agent-tincan -- tincan mcp
                      (then set default_tools_approval_mode for it; see docs/adapters/codex.md)
     - Hermes:        hermes mcp add agent-tincan --command tincan --args mcp ; hermes gateway restart

@@ -487,10 +487,10 @@ tincan join <code> --relay http://tincan-relay  # the Mac
 
 #### How it wakes
 
-Channel. Add the MCP server with `--channel` and start Claude Code with the development channels flag (channels are a Claude Code research preview):
+Channel. Add the MCP server with `--channel` and start Claude Code with the development channels flag (channels are a Claude Code research preview). `--scope user` makes the server part of every project; without it, `claude mcp add` keeps it to the directory it was run in, and sessions started elsewhere have no tincan tools.
 
 ```bash
-claude mcp add agent-tincan -- tincan mcp --channel
+claude mcp add --scope user agent-tincan -- tincan mcp --channel
 claude --dangerously-load-development-channels server:agent-tincan
 ```
 

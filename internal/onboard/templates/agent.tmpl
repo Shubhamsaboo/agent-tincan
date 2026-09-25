@@ -155,7 +155,7 @@ Paste the standing instructions; {{.Name}} starts tincan wait & and keeps it run
 {{- end -}}
 
 {{- define "setup.claude-code" -}}
-Add the MCP server: claude mcp add agent-tincan -- tincan mcp --channel
+Add the MCP server for every project: claude mcp add --scope user agent-tincan -- tincan mcp --channel (without --scope user it exists only in the directory it was added in)
 Start the session with channels: claude --dangerously-load-development-channels server:agent-tincan (keep it open), and pre-approve mcp__agent-tincan__* in /permissions.
 On the relay host, in wake.json: set {{.Name}} to method "channel". No secret fields.
 Fallback without channels: tincan listen --exec <script that opens a Claude Code session>, and set method "command" instead.

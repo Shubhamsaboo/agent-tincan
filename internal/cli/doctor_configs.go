@@ -13,7 +13,11 @@ import (
 // mcpConfigEntry is one MCP server entry, in a config file an app reads,
 // that runs or names tincan.
 type mcpConfigEntry struct {
-	File     string   `json:"file"`
+	File string `json:"file"`
+	// Scope is where in the file the entry sits when the file keeps a
+	// server map per project (Claude Code: "projects.<path>"); "" for the
+	// map the app loads everywhere.
+	Scope    string   `json:"scope,omitempty"`
 	Name     string   `json:"name"`
 	Command  string   `json:"command"`
 	Args     []string `json:"args,omitempty"`
@@ -33,7 +37,7 @@ func mcpConfigFiles(extra []string) []string {
 		filepath.Join(home, ".codex", "config.toml"),
 		filepath.Join(home, ".gemini", "settings.json"),
 		filepath.Join(home, ".codeium", "windsurf", "mcp_config.json"),
-		filepath.Join(home, ".hermes", "config.json"),
+		filepath.Join(home, ".hermes", "config.yaml"),
 		filepath.Join(home, ".openclaw", "openclaw.json"),
 		filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"),
 		filepath.Join(home, ".config", "Claude", "claude_desktop_config.json"),
@@ -65,22 +69,42 @@ func findMCPConfigs(extra []string) []mcpConfigEntry {
 			continue
 		}
 		var es []mcpConfigEntry
-		if strings.HasSuffix(f, ".toml") {
+		switch {
+		case strings.HasSuffix(f, ".toml"):
 			es = tomlServers(string(raw))
-		} else {
+		case strings.HasSuffix(f, ".yaml") || strings.HasSuffix(f, ".yml"):
+			es = yamlServers(string(raw))
+		default:
 			var v any
 			if json.Unmarshal(raw, &v) != nil {
 				all = append(all, mcpConfigEntry{File: f, Problems: []string{"mentions tincan but is not valid JSON, so the app may ignore the whole file"}, broken: true})
 				continue
 			}
-			jsonServers(v, &es)
+			jsonServers(v, "", &es)
 		}
 		for i := range es {
 			es[i].File = f
 		}
-		if len(es) > 1 {
-			for i := range es {
-				es[i].Problems = append(es[i].Problems, fmt.Sprintf("one of %d tincan servers in this file; keep one", len(es)))
+		// Servers the app loads together compete: the map it loads
+		// everywhere plus the one for the current project. Entries under
+		// different projects never load together, so a server added in two
+		// directories is not two servers.
+		everywhere, mostInProject, perScope := 0, 0, map[string]int{}
+		for _, e := range es {
+			if e.Scope == "" {
+				everywhere++
+				continue
+			}
+			perScope[e.Scope]++
+			mostInProject = max(mostInProject, perScope[e.Scope])
+		}
+		for i := range es {
+			together := everywhere + mostInProject
+			if es[i].Scope != "" {
+				together = everywhere + perScope[es[i].Scope]
+			}
+			if together > 1 {
+				es[i].Problems = append(es[i].Problems, fmt.Sprintf("one of %d tincan servers this file loads together; keep one", together))
 				es[i].broken = true
 			}
 		}
@@ -90,24 +114,34 @@ func findMCPConfigs(extra []string) []mcpConfigEntry {
 }
 
 // jsonServers collects tincan entries from any "mcpServers" or "servers"
-// map in v, at any depth (Claude Code keeps one per project).
-func jsonServers(v any, out *[]mcpConfigEntry) {
+// map in v, at any depth (Claude Code keeps one per project). path names
+// the map that holds v. Only a Claude Code project map ("projects.<path>")
+// becomes the entry's Scope; any other map (the top of the file, OpenClaw's
+// mcp.servers) is one the app loads everywhere, so its Scope is "".
+func jsonServers(v any, path string, out *[]mcpConfigEntry) {
 	switch t := v.(type) {
 	case []any:
 		for _, x := range t {
-			jsonServers(x, out)
+			jsonServers(x, path, out)
 		}
 	case map[string]any:
 		for k, x := range t {
 			if servers, ok := x.(map[string]any); ok && (k == "mcpServers" || k == "servers" || k == "mcp_servers") {
 				for name, s := range servers {
 					if e, ok := jsonEntry(name, s); ok {
+						if strings.HasPrefix(path, "projects.") {
+							e.Scope = path
+						}
 						*out = append(*out, e)
 					}
 				}
 				continue
 			}
-			jsonServers(x, out)
+			sub := k
+			if path != "" {
+				sub = path + "." + k
+			}
+			jsonServers(x, sub, out)
 		}
 	}
 }
@@ -190,6 +224,111 @@ func tomlServers(s string) []mcpConfigEntry {
 	}
 	flush()
 	return out
+}
+
+// yamlServers reads the mcp_servers block of a Hermes config.yaml. tincan
+// carries no YAML parser, so it reads only the flat shape Hermes documents:
+// a server name, then command, args (a flow list or a block list) and
+// enabled, at deeper indents. Anything else in the file is skipped.
+func yamlServers(s string) []mcpConfigEntry {
+	var out []mcpConfigEntry
+	var cur *mcpConfigEntry
+	block, server := -1, -1 // indents of the mcp_servers key and of server names
+	field := -1             // indent of the current server's own keys
+	inArgs := false
+	flush := func() {
+		if cur != nil && mentionsTincan(*cur) {
+			out = append(out, *cur)
+		}
+		cur = nil
+	}
+	for line := range strings.SplitSeq(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if block >= 0 && indent <= block {
+			flush()
+			block, server = -1, -1
+		}
+		if block < 0 {
+			if yamlScalar(trimmed) == "mcp_servers:" {
+				block = indent
+			}
+			continue
+		}
+		if server < 0 || indent <= server {
+			// A server name is a key with nothing after the colon.
+			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(value) == "" && !strings.HasPrefix(trimmed, "- ") {
+				flush()
+				server = indent
+				cur = &mcpConfigEntry{Name: yamlScalar(key)}
+				field = -1
+				inArgs = false
+			}
+			continue
+		}
+		if cur == nil {
+			continue
+		}
+		if inArgs && strings.HasPrefix(trimmed, "- ") {
+			cur.Args = append(cur.Args, yamlScalar(strings.TrimPrefix(trimmed, "- ")))
+			continue
+		}
+		if field < 0 {
+			field = indent
+		}
+		if indent > field {
+			// A key in a sub-block such as env belongs to that block, not
+			// to the server.
+			continue
+		}
+		inArgs = false
+		key, value, ok := strings.Cut(trimmed, ":")
+		if !ok {
+			continue
+		}
+		value = yamlScalar(value)
+		switch strings.TrimSpace(key) {
+		case "command":
+			cur.Command = value
+		case "args":
+			if value == "" {
+				inArgs = true
+			} else if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+				for it := range strings.SplitSeq(strings.Trim(value, "[]"), ",") {
+					if it = yamlScalar(it); it != "" {
+						cur.Args = append(cur.Args, it)
+					}
+				}
+			}
+		case "enabled":
+			if value == "false" {
+				cur.Problems = append(cur.Problems, "disabled")
+				cur.broken = true
+			}
+		case "disabled":
+			if value == "true" {
+				cur.Problems = append(cur.Problems, "disabled")
+				cur.broken = true
+			}
+		}
+	}
+	flush()
+	return out
+}
+
+// yamlScalar is a YAML scalar without its trailing comment or its quotes.
+func yamlScalar(v string) string {
+	if i := strings.Index(v, " #"); i >= 0 {
+		v = v[:i]
+	}
+	v = strings.TrimSpace(v)
+	if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
+		return v[1 : len(v)-1]
+	}
+	return v
 }
 
 func mentionsTincan(e mcpConfigEntry) bool {
