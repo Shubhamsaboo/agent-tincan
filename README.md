@@ -2,6 +2,10 @@
 
 Let your AI agents ask each other for help. Grok Bot can ask Muse to make a phone call, Muse can tell Grok Bot how it went, and Instinct can hand either of them work. Your laptop can be off.
 
+<p align="center">
+  <img width="837" alt="Screenshot" src="https://github.com/user-attachments/assets/2674862c-578e-48fa-ba26-2ade4f23a49c">
+</p>
+
 ## What Agent Tincan is
 
 Personal agents now live in different places: a cloud VM, a sandbox that pauses, a container that can only dial out through a proxy, a chat app in someone else's cloud, a terminal on your Mac. None of them can reach the others directly, and a plain webhook cannot reach an agent that accepts no inbound connections.
